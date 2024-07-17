@@ -124,11 +124,15 @@ struct _Seeker {
     // Internal fields
     /// Indicates whether the Seeker has been initialized.
     inited: bool,
+
     /// Internal limit value.
-    _limit: usize,
+    limit: usize,
 
     /// A vector indicating whether each memory page is readable.
     page_readable: Vec<bool>,
+
+    /// Save last result
+    last: usize,
 }
 
 /// Seeker used for searching memory sections.
@@ -163,13 +167,20 @@ impl Seeker {
                 sections: HashMap::new(),
 
                 inited: false,
-                _limit: 0,
+                limit: 0,
 
                 page_readable: Vec::new(),
+
+                last: 0,
             }),
             page_size,
             page_shift,
         }
+    }
+
+    pub fn limit(&self, limit: usize) -> &Self {
+        self.ctx.borrow_mut().limit = limit;
+        self
     }
 
     pub fn module_base(&self) -> usize {
@@ -186,6 +197,14 @@ impl Seeker {
 
     pub fn sections(&self) -> HashMap<String, Section> {
         self.ctx.borrow().sections.clone()
+    }
+
+    pub fn addr(&self) -> Result<usize> {
+        let a = std::mem::take(&mut self.ctx.borrow_mut().last);
+        if a == 0 {
+            bail!("invalid addr")
+        }
+        Ok(a)
     }
 
     /// create a Seeker object and bind a module. the module name is "main", bind the main module.
@@ -312,15 +331,15 @@ impl Seeker {
     /// let addr = sker.search("00 ? 00")?;
     /// ```
     ///
-    pub fn search(&self, sig: &str) -> Result<usize> {
-        let ctx = self.ctx.borrow();
-
-        if !ctx.inited {
+    pub fn search(&self, sig: &str) -> Result<&Self> {
+        if !self.ctx.borrow().inited {
             bail!("seeker uninited");
         }
 
         let (pattern, mask) = Self::sig2raw(sig)?;
-        self.search_pattern(&pattern, &mask, ctx.module_base, ctx.module_size)
+
+        self.ctx.borrow_mut().last = self.in_search(&pattern, &mask, 0, 0, 0)?;
+        Ok(self)
     }
 
     /// reverse search a signature.
@@ -331,7 +350,7 @@ impl Seeker {
     /// let addr = sker.reverse_search("00 ? 00")?;
     /// ```
     ///
-    pub fn reverse_search(&self, sig: &str) -> Result<usize> {
+    pub fn reverse_search(&self, sig: &str) -> Result<&Self> {
         let ctx = self.ctx.borrow();
 
         if !ctx.inited {
@@ -339,12 +358,9 @@ impl Seeker {
         }
 
         let (pattern, mask) = Self::sig2raw(sig)?;
-        self.reverse_search_pattern(
-            &pattern,
-            &mask,
-            ctx.module_base + ctx.module_size,
-            ctx.module_size,
-        )
+
+        self.ctx.borrow_mut().last = self.in_reverse_search(&pattern, &mask, 0, 0, 0)?;
+        Ok(self)
     }
 
     /// search a signature use mask.
@@ -393,6 +409,117 @@ impl Seeker {
 
 // private
 impl Seeker {
+    fn adjust_range(
+        &self,
+        mut start: usize,
+        mut length: usize,
+        off: usize,
+        reverse: bool,
+    ) -> Result<(usize, usize)> {
+        let ctx = self.ctx.borrow();
+
+        let (ostart, olength) = (start, length);
+
+        // result first
+        if ctx.last != 0 {
+            start = ctx.last;
+            if reverse {
+                start -= off;
+            } else {
+                start += off;
+            }
+            length = ctx.limit;
+        }
+        // start first
+        else if start == 0 {
+            start = ctx.module_base;
+            length = ctx.module_size;
+        }
+
+        if length == 0 {
+            length = start - if ostart == 0 { ctx.module_base } else { ostart };
+
+            if !reverse {
+                length = ctx.limit
+                    - if olength == 0 {
+                        ctx.module_size
+                    } else {
+                        olength
+                    };
+            }
+        }
+
+        if start == 0 || length == 0 {
+            bail!("invalid adjust_range")
+        }
+
+        Ok((start, length))
+    }
+
+    fn reset(&self) {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.last = 0;
+        ctx.limit = 0;
+    }
+
+    fn in_search(
+        &self,
+        pattern: &[u8],
+        mask: &[char],
+        off: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<usize> {
+        if pattern.len() == 0 || mask.len() == 0 {
+            self.reset();
+            bail!(std::format!(
+                "invalid pattern({}) or mask({})",
+                pattern.len(),
+                mask.len()
+            ))
+        }
+
+        let (start, length) = self.adjust_range(start, length, off, false).map_err(|e| {
+            self.reset();
+            e
+        })?;
+
+        self.search_pattern(pattern, mask, start, length)
+            .map_err(|e| {
+                self.reset();
+                e
+            })
+    }
+
+    fn in_reverse_search(
+        &self,
+        pattern: &[u8],
+        mask: &[char],
+        off: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<usize> {
+        if pattern.len() == 0 || mask.len() == 0 {
+            self.reset();
+            bail!(std::format!(
+                "invalid pattern({}) or mask({})",
+                pattern.len(),
+                mask.len()
+            ))
+        }
+
+        let (start, length) = self.adjust_range(start, length, off, true).map_err(|e| {
+            self.reset();
+            e
+        })?;
+
+        self.reverse_search_pattern(pattern, mask, start, length)
+            .map_err(|e| {
+                self.reset();
+                e
+            })
+    }
+
     fn search_pattern(
         &self,
         pattern: &[u8],

@@ -1,5 +1,5 @@
 fn main() {
-    let Ok(mut sker) = sigmatch::Seeker::with_name("main") else {
+    let Ok(sker) = sigmatch::Seeker::with_name("main") else {
         return;
     };
 
@@ -7,9 +7,9 @@ fn main() {
         return;
     };
 
-    println!("{:#x}", addr.wrapping_sub(sker.module_base as _) as usize);
+    println!("{:#x}", addr.wrapping_sub(sker.module_base()));
 
-    let Ok(mut sker) = sigmatch::Seeker::with_name("user32.dll") else {
+    let Ok(sker) = sigmatch::Seeker::with_name("user32.dll") else {
         return;
     };
 
@@ -38,7 +38,7 @@ fn main() {
     }();
 
     // new Seeker
-    let mut sker1 = sigmatch::Seeker::new();
+    let sker1 = sigmatch::Seeker::new();
     if sker1.bind("ntdll.dll").is_err() {
         return;
     }

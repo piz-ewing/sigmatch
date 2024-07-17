@@ -56,7 +56,7 @@
 //! [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).
 //!
 use anyhow::{bail, Context, Result};
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
 #[cfg(target_arch = "x86")]
 use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
@@ -103,6 +103,7 @@ macro_rules! INDEX {
 }
 
 /// Section Information.
+#[derive(Clone)]
 pub struct Section {
     /// The base address of the section.
     pub section_base: usize,
@@ -110,16 +111,15 @@ pub struct Section {
     pub section_size: usize,
 }
 
-/// Seeker used for searching memory sections.
-pub struct Seeker {
+struct _Seeker {
     /// The name of the module.
-    pub module_name: String,
+    module_name: String,
     /// The size of the module.
-    pub module_size: usize,
+    module_size: usize,
     /// The base address of the module.
-    pub module_base: usize,
+    module_base: usize,
     /// A map of section names to their corresponding Section structs.
-    pub sections: HashMap<String, Section>,
+    sections: HashMap<String, Section>,
 
     // Internal fields
     /// Indicates whether the Seeker has been initialized.
@@ -127,13 +127,19 @@ pub struct Seeker {
     /// Internal limit value.
     _limit: usize,
 
+    /// A vector indicating whether each memory page is readable.
+    page_readable: Vec<bool>,
+}
+
+/// Seeker used for searching memory sections.
+pub struct Seeker {
+    ctx: RefCell<_Seeker>,
+
     // Page info
     /// The size of a memory page.
     page_size: usize,
     /// The shift value used for calculating memory page sizes.
     page_shift: u8,
-    /// A vector indicating whether each memory page is readable.
-    page_readable: Vec<bool>,
 }
 
 // public
@@ -146,19 +152,40 @@ impl Seeker {
     /// ```
     ///
     pub fn new() -> Self {
+        let page_size = Self::get_page_size();
+        let page_shift = Self::get_page_shift(page_size);
+
         Seeker {
-            module_name: String::new(),
-            module_size: 0,
-            module_base: 0 as _,
-            sections: HashMap::new(),
+            ctx: RefCell::new(_Seeker {
+                module_name: String::new(),
+                module_size: 0,
+                module_base: 0 as _,
+                sections: HashMap::new(),
 
-            inited: false,
-            _limit: 0,
+                inited: false,
+                _limit: 0,
 
-            page_size: 0,
-            page_shift: 0,
-            page_readable: Vec::new(),
+                page_readable: Vec::new(),
+            }),
+            page_size,
+            page_shift,
         }
+    }
+
+    pub fn module_base(&self) -> usize {
+        self.ctx.borrow().module_base
+    }
+
+    pub fn module_name(&self) -> String {
+        self.ctx.borrow().module_name.to_owned()
+    }
+
+    pub fn module_size(&self) -> usize {
+        self.ctx.borrow().module_size
+    }
+
+    pub fn sections(&self) -> HashMap<String, Section> {
+        self.ctx.borrow().sections.clone()
     }
 
     /// create a Seeker object and bind a module. the module name is "main", bind the main module.
@@ -169,7 +196,7 @@ impl Seeker {
     /// ```
     ///
     pub fn with_name(module_name: &str) -> Result<Self> {
-        let mut sker = Self::new();
+        let sker = Self::new();
         sker.bind(module_name)?;
         return Ok(sker);
     }
@@ -182,12 +209,10 @@ impl Seeker {
     /// sker.bind("user32.dll");
     /// ```
     ///
-    pub fn bind(&mut self, module_name: &str) -> Result<&mut Self> {
-        self.inited = false;
+    pub fn bind(&self, module_name: &str) -> Result<&Self> {
+        let mut ctx = self.ctx.borrow_mut();
 
-        if self.page_size == 0 || self.page_shift == 0 {
-            self.page_info()?;
-        }
+        ctx.inited = false;
 
         let module_base = if module_name == "main" {
             let Ok(r) = (unsafe { GetModuleHandleW(PCWSTR::null()) }) else {
@@ -206,11 +231,11 @@ impl Seeker {
             bail!("{} module handle is_invalid", module_name);
         }
 
-        self.module_base = module_base.0 as _;
-        self.module_name = module_name.to_owned();
+        ctx.module_base = module_base.0 as _;
+        ctx.module_name = module_name.to_owned();
 
         unsafe {
-            let dos_header = self.module_base as *const IMAGE_DOS_HEADER;
+            let dos_header = ctx.module_base as *const IMAGE_DOS_HEADER;
             if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
                 bail!("{} module dos header invalid", module_name)
             }
@@ -222,18 +247,18 @@ impl Seeker {
             type ImageNtHeaders = IMAGE_NT_HEADERS32;
 
             let nt_header =
-                (self.module_base + (*dos_header).e_lfanew as usize) as *const ImageNtHeaders;
+                (ctx.module_base + (*dos_header).e_lfanew as usize) as *const ImageNtHeaders;
 
             if (*nt_header).Signature != IMAGE_NT_SIGNATURE {
                 bail!("{} module nt header invalid", module_name)
             }
 
-            self.module_size = (*nt_header).OptionalHeader.SizeOfImage as _;
-            if self.module_size == 0 {
+            ctx.module_size = (*nt_header).OptionalHeader.SizeOfImage as _;
+            if ctx.module_size == 0 {
                 bail!("{} module_size is zero", module_name)
             }
 
-            let section_header = (self.module_base
+            let section_header = (ctx.module_base
                 + (*dos_header).e_lfanew as usize
                 + memoffset::offset_of!(ImageNtHeaders, OptionalHeader) as usize
                 + (*nt_header).FileHeader.SizeOfOptionalHeader as usize)
@@ -245,13 +270,12 @@ impl Seeker {
                     .trim_end_matches(char::from(0))
                     .to_string();
                 let section_rva = (*section).VirtualAddress as usize;
-                let section_base = self.module_base + section_rva;
+                let section_base = ctx.module_base + section_rva;
                 let section_size = (*section).SizeOfRawData as usize;
 
-                self.page_readable.resize(
-                    ALIGN!(self.module_size, self.page_size) >> self.page_shift,
-                    false,
-                );
+                let ms = ctx.module_size;
+                ctx.page_readable
+                    .resize(ALIGN!(ms, self.page_size) >> self.page_shift, false);
 
                 let section_readable =
                     ((*section).Characteristics & IMAGE_SCN_MEM_READ) == IMAGE_SCN_MEM_READ;
@@ -259,14 +283,14 @@ impl Seeker {
                     let index = ALIGN!(section_rva, self.page_size) >> self.page_shift;
                     let len = ALIGN!(section_size, self.page_size) >> self.page_shift;
                     for j in index..(index + len) {
-                        let page = self.page_readable.get_mut(j).context(format!(
+                        let page = ctx.page_readable.get_mut(j).context(format!(
                             "module {} section {} out of bounds",
                             module_name, section_name,
                         ))?;
                         *page = true;
                     }
                 }
-                self.sections.insert(
+                ctx.sections.insert(
                     section_name,
                     Section {
                         section_base,
@@ -276,7 +300,7 @@ impl Seeker {
             }
         }
 
-        self.inited = true;
+        ctx.inited = true;
         Ok(self)
     }
 
@@ -288,13 +312,15 @@ impl Seeker {
     /// let addr = sker.search("00 ? 00")?;
     /// ```
     ///
-    pub fn search(&mut self, sig: &str) -> Result<usize> {
-        if !self.inited {
+    pub fn search(&self, sig: &str) -> Result<usize> {
+        let ctx = self.ctx.borrow();
+
+        if !ctx.inited {
             bail!("seeker uninited");
         }
 
         let (pattern, mask) = Self::sig2raw(sig)?;
-        self.search_pattern(&pattern, &mask, self.module_base, self.module_size)
+        self.search_pattern(&pattern, &mask, ctx.module_base, ctx.module_size)
     }
 
     /// reverse search a signature.
@@ -305,8 +331,10 @@ impl Seeker {
     /// let addr = sker.reverse_search("00 ? 00")?;
     /// ```
     ///
-    pub fn reverse_search(&mut self, sig: &str) -> Result<usize> {
-        if !self.inited {
+    pub fn reverse_search(&self, sig: &str) -> Result<usize> {
+        let ctx = self.ctx.borrow();
+
+        if !ctx.inited {
             bail!("seeker uninited");
         }
 
@@ -314,8 +342,8 @@ impl Seeker {
         self.reverse_search_pattern(
             &pattern,
             &mask,
-            self.module_base + self.module_size,
-            self.module_size,
+            ctx.module_base + ctx.module_size,
+            ctx.module_size,
         )
     }
 
@@ -327,13 +355,15 @@ impl Seeker {
     /// let addr = sker.raw_search( b"\xE8\x00\x00\x00\x00", "x????")?;
     /// ```
     ///
-    pub fn raw_search(&mut self, pattern: &[u8], mask: &str) -> Result<usize> {
-        if !self.inited {
+    pub fn raw_search(&self, pattern: &[u8], mask: &str) -> Result<usize> {
+        let ctx = self.ctx.borrow();
+
+        if !ctx.inited {
             bail!("seeker uninited");
         }
 
         let m_chars: Vec<char> = mask.chars().collect();
-        self.search_pattern(&pattern, &m_chars, self.module_base, self.module_size)
+        self.search_pattern(&pattern, &m_chars, ctx.module_base, ctx.module_size)
     }
 
     /// reverse search a signature use mask.
@@ -344,8 +374,10 @@ impl Seeker {
     /// let addr = sker.raw_reverse_search( b"\xE8\x00\x00\x00\x00", "x????")?;
     /// ```
     ///
-    pub fn raw_reverse_search(&mut self, pattern: &[u8], mask: &str) -> Result<usize> {
-        if !self.inited {
+    pub fn raw_reverse_search(&self, pattern: &[u8], mask: &str) -> Result<usize> {
+        let ctx = self.ctx.borrow();
+
+        if !ctx.inited {
             bail!("seeker uninited");
         }
 
@@ -353,28 +385,14 @@ impl Seeker {
         self.reverse_search_pattern(
             &pattern,
             &m_chars,
-            self.module_base + self.module_size,
-            self.module_size,
+            ctx.module_base + ctx.module_size,
+            ctx.module_size,
         )
     }
 }
 
 // private
 impl Seeker {
-    fn page_info(&mut self) -> Result<()> {
-        self.page_size = Self::get_page_size();
-        if self.page_size == 0 {
-            bail!("get page_size 0");
-        }
-
-        self.page_shift = Self::get_page_shift(self.page_size);
-        if self.page_shift == 0 {
-            bail!("get page_shift 0");
-        }
-
-        Ok(())
-    }
-
     fn search_pattern(
         &self,
         pattern: &[u8],
@@ -387,7 +405,8 @@ impl Seeker {
             bail!("src len < pattern len");
         }
 
-        let base_index = INDEX!(self.module_base, self.page_shift);
+        let ctx = self.ctx.borrow();
+        let base_index = INDEX!(ctx.module_base, self.page_shift);
         let mut last_index = 0;
 
         let mut addr = start;
@@ -396,7 +415,7 @@ impl Seeker {
         while addr <= end {
             let page_index = INDEX!(addr, self.page_shift);
             if page_index != last_index {
-                if self.page_readable[page_index - base_index] {
+                if ctx.page_readable[page_index - base_index] {
                     last_index = page_index;
                 } else {
                     addr += self.page_size;
@@ -425,8 +444,9 @@ impl Seeker {
         if fixlen == 0 {
             bail!("src len < pattern len");
         }
+        let ctx = self.ctx.borrow();
 
-        let base_index = INDEX!(self.module_base, self.page_shift);
+        let base_index = INDEX!(ctx.module_base, self.page_shift);
         let mut last_index = 0;
 
         let mut addr = start - pattern.len();
@@ -435,7 +455,7 @@ impl Seeker {
         while addr >= end {
             let page_index = INDEX!(addr, self.page_shift);
             if page_index != last_index {
-                if self.page_readable[page_index - base_index] {
+                if ctx.page_readable[page_index - base_index] {
                     last_index = page_index;
                 } else {
                     addr -= self.page_size;
@@ -470,7 +490,7 @@ impl Seeker {
                 return shift;
             }
         }
-        0
+        panic!("invalid page size")
     }
 
     fn sig2raw(sig: &str) -> Result<(Vec<u8>, Vec<char>)> {

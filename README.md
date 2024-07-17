@@ -1,4 +1,5 @@
 # sigmatch
+
 A memory signature search library for the Windows platform written in Rust.
 
 It's a basic version migrated from another C++ project of mine, with more features coming soon!
@@ -9,14 +10,15 @@ It's a basic version migrated from another C++ project of mine, with more featur
 [![Crates.io](https://img.shields.io/crates/d/sigmatch)](https://github.com/piz-ewing/sigmatch)
 
 ## Quick Use
+
 Assuming you've obtained the signatures via [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker).
 
-| Signature type | Example preview |
-| --- | ----------- |
-| IDA Signature | E8 ? ? ? ? 45 33 F6 66 44 89 34 33 |
-| x64Dbg Signature | E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33 |
-| C Byte Array Signature + String mask | \xE8\x00\x00\x00\x00\x45\x33\xF6\x66\x44\x89\x34\x33 x????xxxxxxxx |
-| C Raw Bytes Signature + Bitmask | 0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33  0b1111111100001 |
+| Signature type                       | Example preview                                                                              |
+| ------------------------------------ | -------------------------------------------------------------------------------------------- |
+| IDA Signature                        | E8 ? ? ? ? 45 33 F6 66 44 89 34 33                                                           |
+| x64Dbg Signature                     | E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33                                                       |
+| C Byte Array Signature + String mask | \xE8\x00\x00\x00\x00\x45\x33\xF6\x66\x44\x89\x34\x33 x????xxxxxxxx                           |
+| C Raw Bytes Signature + Bitmask      | 0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33 0b1111111100001 |
 
 ```toml
 [dependencies]
@@ -26,7 +28,7 @@ sigmatch = "0.1"
 
 ```rust
 fn main() {
-        let Ok(mut sker) = sigmatch::Seeker::with_name("user32.dll") else {
+    let Ok(mut sker) = sigmatch::Seeker::with_name("user32.dll") else {
         return;
     };
 
@@ -64,17 +66,19 @@ fn main() {
 ```
 
 ## todo
-- supports chaining calls.
 
-- allows specifying search addresses.
+-   supports chaining calls.
 
-- section-based search support.
+-   allows specifying search addresses.
 
-- support for limiting the search.
+-   section-based search support.
 
-- unit testing
+-   support for limiting the search.
 
-- improved file organization
+-   unit testing
+
+-   improved file organization
 
 ## examples
+
 More than examples can see [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).

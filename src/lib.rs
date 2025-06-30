@@ -13,9 +13,11 @@
 //! ```
 //!
 //! ```ignore
+//! use sigmatch::{Result, Seeker};
+//!
 //! fn example() -> Result<()> {
 //!
-//!     let sker = sigmatch::Seeker::with_name("main")?;
+//!     let sker = Seeker::with_name("main")?;
 //!
 //!     // Searching: forward search (push+mov+mov eax...)
 //!     let addr = sker
@@ -70,8 +72,7 @@
 //! More than examples can see:
 //! [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).
 //!
-pub use anyhow::Result;
-use anyhow::{anyhow, bail, Context};
+pub use anyhow::{anyhow, bail, Context, Error, Result};
 use custom_debug::Debug;
 use log::debug;
 use std::{cell::RefCell, collections::HashMap, fmt};

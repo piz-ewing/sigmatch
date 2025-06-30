@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
 use log::*;
+use sigmatch::{anyhow, Result, Seeker};
 use windows::{
     core::s,
     Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress},
@@ -22,7 +22,7 @@ pub(crate) unsafe extern "C" fn magic_function() {
 fn example() -> Result<()> {
     let expected = magic_function as usize;
 
-    let sker = sigmatch::Seeker::with_name("main")?;
+    let sker = Seeker::with_name("main")?;
 
     info!("🔍 Searching: forward search (push+mov+mov eax...)");
     let addr = sker

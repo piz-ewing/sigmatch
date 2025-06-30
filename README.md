@@ -26,9 +26,11 @@ sigmatch = "0.2"
 ```
 
 ```rust
+use sigmatch::{Result, Seeker};
+
 fn example() -> Result<()> {
 
-    let sker = sigmatch::Seeker::with_name("main")?;
+    let sker = Seeker::with_name("main")?;
 
     // Searching: forward search (push+mov+mov eax...)
     let addr = sker

@@ -1,6 +1,6 @@
 [package]
 name = "sigmatch"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "A memory signature search library for the Windows platform written in Rust."
 keywords = ["signature", "sigmatch", "sig", "pattern", "sigsearch"]

@@ -431,7 +431,8 @@ impl Seeker {
     /// # Examples
     /// ```ignore
     /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = seeker.search("00 ? 00")?;
+    /// let addr = seeker.search("00 ? 00")?
+    ///                  .addr()?;
     /// ```
     pub fn search(&self, sig: &str) -> Result<&Self> {
         self.search_internal(sig, false, None)
@@ -442,7 +443,8 @@ impl Seeker {
     /// # Examples
     /// ```ignore
     /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = seeker.reverse_search("00 ? 00")?;
+    /// let addr = seeker.reverse_search("00 ? 00")?
+    ///                  .addr()?;
     /// ```
     pub fn reverse_search(&self, sig: &str) -> Result<&Self> {
         self.search_internal(sig, true, None)
@@ -453,7 +455,8 @@ impl Seeker {
     /// # Examples
     /// ```ignore
     /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = seeker.search_in_section("00 ? 00", ".text")?;
+    /// let addr = seeker.search_in_section("00 ? 00", ".text")?
+    ///                  .addr()?;
     /// ```
     pub fn search_in_section(&self, sig: &str, name: &str) -> Result<&Self> {
         self.search_internal(sig, false, Some(name))
@@ -464,7 +467,8 @@ impl Seeker {
     /// # Examples
     /// ```ignore
     /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = seeker.reverse_search_in_section("00 ? 00", ".text")?;
+    /// let addr = seeker.reverse_search_in_section("00 ? 00", ".text")?
+    ///                  .addr()?;
     /// ```
     pub fn reverse_search_in_section(&self, sig: &str, name: &str) -> Result<&Self> {
         self.search_internal(sig, true, Some(name))

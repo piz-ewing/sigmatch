@@ -13,7 +13,7 @@ impl PCWSTRWrapper {
     /// SAFETY:
     /// - You must bind PCWSTRWrapper to a variable, or it'll create a temporary and drop it.
     ///   E.g. `let foo = "bar".to_pcwstr().as_pcwstr()` drops after statement, and
-    ///        the raw pointer is dangling
+    ///   the raw pointer is dangling
     ///   However, `foo("bar".to_pcwstr().as_pcwstr())` is fine since it'll drop after
     ///   the fn call
     /// - Since this hands out a raw pointer, it can easily escape the lifetime of PCWSTRWrapper.

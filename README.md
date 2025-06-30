@@ -22,63 +22,71 @@ Assuming you've obtained the signatures via [IDA-Pro-SigMaker](https://github.co
 
 ```toml
 [dependencies]
-anyhow = "1.0"
-sigmatch = "0.1"
+sigmatch = "0.2"
 ```
 
 ```rust
-fn main() {
-    let Ok(mut sker) = sigmatch::Seeker::with_name("user32.dll") else {
-        return;
-    };
+fn example() -> Result<()> {
 
-    // IDA sig
-    let Ok(_ida_example) = sker.search("E8 ? ? ? ? 45 33 F6 66 44 89 34 33") else {
-        return;
-    };
+    let sker = sigmatch::Seeker::with_name("main")?;
 
-    // x64dbg sig
-    let Ok(_x64dbg_example) = sker.search("E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33") else {
-        return;
-    };
+    // Searching: forward search (push+mov+mov eax...)
+    let addr = sker
+        .search("6A ?? 89 E0 B8 ?? ?? ?? ?? C1 C0 05 05 ?? ?? ?? 90 90 90")?
+        .addr()?;
 
-    // c sig + mask
-    let Ok(_c_example) = sker.raw_search(
-        b"\xE8\x00\x00\x00\x00\x45\x33\xF6\x66\x44\x89\x34\x33",
-        "x????xxxxxxxx",
-    ) else {
-        return;
-    };
+    // Reverse search from mov eax block
+    let addr = sker
+        .search("B8 ?? ?? ?? ?? C1 C0 05 05 ?? ?? ?? 90 90 90")?
+        .reverse_search("6A ?? 89 E0")?
+        .addr()?;
 
-    // rebind and reversese_search
-    let _ = || -> anyhow::Result<()> {
-        // the module name is "main", then retrieve the main module.
-        let _rebind_example = sker.bind("main")?.reverse_search("ab cd ?? ef")?;
-        Ok(())
-    }();
+    // Complex range + limit + offset
+    let addr = sker
+        .search("B8 ?? ?? ?? ?? C1 C0 05 05 ?? ?? ?? 90 90 90")?
+        .limit(8)
+        .reverse_search("6A ?? 89 E0")?
+        .offset(16)
+        .limit(1)
+        .debug()
+        .search("90")?
+        .debug()
+        .addr()?;
 
-    // new Seeker
-    let mut sker1 = sigmatch::Seeker::new();
-    if sker1.bind("ntdll.dll").is_err() {
-        return;
-    }
+    // Rebind to system module
+    sker.bind("ntdll.dll")?;
+
+    // IDA-style pattern
+    let _ = sker
+        .search("? ? ? B8 C0 00 00 00 F6 04 25 ? ? ? ? 01 75 ? 0F 05 C3")?
+        .addr()?;
+
+    // x64dbg-style pattern
+    let _ = sker.search("?? ?? ?? B8 C0 00 00 00 F6 04 25")?.addr()?;
+
+    // C-style raw + mask
+    let _ = sker.raw_search(
+        b"\x00\x00\x00\xB8\xC0\x00\x00\x00\xF6\x04\x25",
+        "???xxxxxxxx",
+    )?;
+
+    // C-style raw + bitmap
+    let _ = sker.raw_search_bitmap(
+        b"\x00\x00\x00\xB8\xC0\x00\x00\x00\xF6\x04\x25",
+        0b00011111111,
+    )?;
+
+    Ok(())
 }
 ```
 
-## todo
+## What's New
+- Method chaining is now supported
+- Section-based signature scanning added
+- Added support for `limit` and `offset` in search
+- Unit test coverage improved
+- Project structure reorganized for better clarity
 
--   supports chaining calls.
-
--   allows specifying search addresses.
-
--   section-based search support.
-
--   support for limiting the search.
-
--   unit testing
-
--   improved file organization
-
-## examples
+## Examples
 
 More than examples can see [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).

@@ -9,60 +9,78 @@
 //!
 //! ```toml
 //! [dependencies]
-//! anyhow = "1.0"
-//! sigmatch = "0.1"
+//! sigmatch = "0.2"
 //! ```
 //!
-//! ```no_run
-//! fn main() {
-//!      let Ok(mut _sker) = sigmatch::Seeker::with_name("user32.dll") else {
-//!          return;
-//!      };
+//! ```ignore
+//! fn example() -> Result<()> {
 //!
-//!      // IDA sig
-//!      let Ok(_ida_example) = sker.search("E8 ? ? ? ? 45 33 F6 66 44 89 34 33") else {
-//!          return;
-//!      };
+//!     let sker = sigmatch::Seeker::with_name("main")?;
 //!
-//!      // x64dbg sig
-//!      let Ok(_x64dbg_example) = sker.search("E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33") else {
-//!          return;
-//!      };
+//!     // Searching: forward search (push+mov+mov eax...)
+//!     let addr = sker
+//!         .search("6A ?? 89 E0 B8 ?? ?? ?? ?? C1 C0 05 05 ?? ?? ?? 90 90 90")?
+//!         .addr()?;
 //!
-//!      // c sig + mask
-//!      let Ok(_c_example) = sker.raw_search(
-//!          b"\xE8\x00\x00\x00\x00\x45\x33\xF6\x66\x44\x89\x34\x33",
-//!          "x????xxxxxxxx",
-//!      ) else {
-//!          return;
-//!      };
+//!     // Reverse search from mov eax block
+//!     let addr = sker
+//!         .search("B8 ?? ?? ?? ?? C1 C0 05 05 ?? ?? ?? 90 90 90")?
+//!         .reverse_search("6A ?? 89 E0")?
+//!         .addr()?;
 //!
-//!      // rebind and reversese_search
-//!      let _ = || -> anyhow::Result<()> {
-//!          // the module name is "main", then retrieve the main module.
-//!          let _rebind_example = sker.bind("main")?.reverse_search("ab cd ?? ef")?;
-//!          Ok(())
-//!      }();
+//!     // Complex range + limit + offset
+//!     let addr = sker
+//!         .search("B8 ?? ?? ?? ?? C1 C0 05 05 ?? ?? ?? 90 90 90")?
+//!         .limit(8)
+//!         .reverse_search("6A ?? 89 E0")?
+//!         .offset(16)
+//!         .limit(1)
+//!         .debug()
+//!         .search("90")?
+//!         .debug()
+//!         .addr()?;
 //!
-//!      // new Seeker
-//!      let mut sker1 = sigmatch::Seeker::new();
-//!      if sker1.bind("ntdll.dll").is_err() {
-//!          return;
-//!      }
+//!     // Rebind to system module
+//!     sker.bind("ntdll.dll")?;
+//!
+//!     // IDA-style pattern
+//!     let _ = sker
+//!         .search("? ? ? B8 C0 00 00 00 F6 04 25 ? ? ? ? 01 75 ? 0F 05 C3")?
+//!         .addr()?;
+//!
+//!     // x64dbg-style pattern
+//!     let _ = sker.search("?? ?? ?? B8 C0 00 00 00 F6 04 25")?.addr()?;
+//!
+//!     // C-style raw + mask
+//!     let _ = sker.raw_search(
+//!         b"\x00\x00\x00\xB8\xC0\x00\x00\x00\xF6\x04\x25",
+//!         "???xxxxxxxx",
+//!     )?;
+//!
+//!     // C-style raw + bitmap
+//!     let _ = sker.raw_search_bitmap(
+//!         b"\x00\x00\x00\xB8\xC0\x00\x00\x00\xF6\x04\x25",
+//!         0b00011111111,
+//!     )?;
+//!
+//!     Ok(())
 //! }
 //! ```
 //!
 //! More than examples can see:
 //! [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).
 //!
-use anyhow::{bail, Context, Result};
-use std::{cell::RefCell, collections::HashMap};
-
-#[cfg(target_arch = "x86")]
-use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
+pub use anyhow::Result;
+use anyhow::{anyhow, bail, Context};
+use custom_debug::Debug;
+use log::debug;
+use std::{cell::RefCell, collections::HashMap, fmt};
 
 #[cfg(target_arch = "x86_64")]
 use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+
+#[cfg(target_arch = "x86")]
+use windows::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS32;
 
 use windows::{
     core::PCWSTR,
@@ -111,24 +129,43 @@ pub struct Section {
     pub section_size: usize,
 }
 
+#[derive(Debug)]
 struct _Seeker {
     /// The name of the module.
     module_name: String,
     /// The size of the module.
+    #[debug(with = hex_fmt)]
     module_size: usize,
     /// The base address of the module.
+    #[debug(with = hex_fmt)]
     module_base: usize,
     /// A map of section names to their corresponding Section structs.
+    #[debug(skip)]
     sections: HashMap<String, Section>,
 
     // Internal fields
     /// Indicates whether the Seeker has been initialized.
     inited: bool,
+
     /// Internal limit value.
-    _limit: usize,
+    #[debug(with = hex_fmt)]
+    limit: usize,
+
+    /// Internal offset value.
+    #[debug(with = hex_fmt)]
+    offset: usize,
 
     /// A vector indicating whether each memory page is readable.
+    #[debug(skip)]
     page_readable: Vec<bool>,
+
+    /// Save last result
+    #[debug(with = hex_fmt)]
+    last: usize,
+}
+
+fn hex_fmt<T: fmt::Debug>(n: &T, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "0x{n:02X?}")
 }
 
 /// Seeker used for searching memory sections.
@@ -147,7 +184,7 @@ impl Seeker {
     /// create a Seeker object.
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let mut sker = sigmatch::Seeker::new();
     /// ```
     ///
@@ -163,13 +200,50 @@ impl Seeker {
                 sections: HashMap::new(),
 
                 inited: false,
-                _limit: 0,
+                limit: 0,
+                offset: 0,
 
                 page_readable: Vec::new(),
+
+                last: 0,
             }),
             page_size,
             page_shift,
         }
+    }
+
+    /// Sets the maximum number of matches for the next search operation only.
+    ///
+    /// The setting is reset after the next search operation.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
+    /// let addr = seeker.limit(10)
+    ///                  .search("00 ? 00")? // Uses limit=10
+    ///                  .search("00 ? 00")? // Uses limit=0
+    ///                  .addr()?;
+    /// ```
+    pub fn limit(&self, limit: usize) -> &Self {
+        self.ctx.borrow_mut().limit = limit;
+        self
+    }
+
+    /// Sets the starting offset for the next search operation only.
+    ///
+    /// The setting is reset after the next search operation.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
+    /// let addr = seeker.offset(0x1000)
+    ///                  .search("00 ? 00")? // Uses offset=0x1000
+    ///                  .search("00 ? 00")? // Uses offset=0
+    ///                  .addr()?;
+    /// ```
+    pub fn offset(&self, offset: usize) -> &Self {
+        self.ctx.borrow_mut().offset = offset;
+        self
     }
 
     pub fn module_base(&self) -> usize {
@@ -188,23 +262,37 @@ impl Seeker {
         self.ctx.borrow().sections.clone()
     }
 
+    pub fn addr(&self) -> Result<usize> {
+        let a = std::mem::take(&mut self.ctx.borrow_mut().last);
+        if a == 0 {
+            bail!("invalid addr")
+        }
+        Ok(a)
+    }
+
+    pub fn debug(&self) -> &Self {
+        let sker = self.ctx.borrow();
+        debug!("{sker:?}");
+        self
+    }
+
     /// create a Seeker object and bind a module. the module name is "main", bind the main module.
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let mut sker = sigmatch::Seeker::with_name("user32.dll")?;
     /// ```
     ///
     pub fn with_name(module_name: &str) -> Result<Self> {
         let sker = Self::new();
         sker.bind(module_name)?;
-        return Ok(sker);
+        Ok(sker)
     }
 
     /// bind a module. the module name is "main", bind the main module.
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let mut sker = sigmatch::Seeker::new();
     /// sker.bind("user32.dll");
     /// ```
@@ -260,13 +348,13 @@ impl Seeker {
 
             let section_header = (ctx.module_base
                 + (*dos_header).e_lfanew as usize
-                + memoffset::offset_of!(ImageNtHeaders, OptionalHeader) as usize
+                + memoffset::offset_of!(ImageNtHeaders, OptionalHeader)
                 + (*nt_header).FileHeader.SizeOfOptionalHeader as usize)
                 as *const IMAGE_SECTION_HEADER;
 
             for i in 0..(*nt_header).FileHeader.NumberOfSections as usize {
                 let section = section_header.wrapping_add(i);
-                let section_name = String::from_utf8_lossy(&(*section).Name[..8])
+                let section_name = String::from_utf8_lossy(&(&(*section).Name)[..8])
                     .trim_end_matches(char::from(0))
                     .to_string();
                 let section_rva = (*section).VirtualAddress as usize;
@@ -284,8 +372,7 @@ impl Seeker {
                     let len = ALIGN!(section_size, self.page_size) >> self.page_shift;
                     for j in index..(index + len) {
                         let page = ctx.page_readable.get_mut(j).context(format!(
-                            "module {} section {} out of bounds",
-                            module_name, section_name,
+                            "module {module_name} section {section_name} out of bounds",
                         ))?;
                         *page = true;
                     }
@@ -304,95 +391,258 @@ impl Seeker {
         Ok(self)
     }
 
-    /// search a signature.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// let mut sker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = sker.search("00 ? 00")?;
-    /// ```
-    ///
-    pub fn search(&self, sig: &str) -> Result<usize> {
-        let ctx = self.ctx.borrow();
-
-        if !ctx.inited {
+    /// Internal helper method for signature searching
+    fn search_internal(
+        &self,
+        sig: &str,
+        reverse: bool,
+        section_name: Option<&str>,
+    ) -> Result<&Self> {
+        if !self.ctx.borrow().inited {
             bail!("seeker uninited");
         }
 
         let (pattern, mask) = Self::sig2raw(sig)?;
-        self.search_pattern(&pattern, &mask, ctx.module_base, ctx.module_size)
+
+        let (base, size) = if let Some(name) = section_name {
+            let ctx = self.ctx.borrow();
+            let section = ctx
+                .sections
+                .get(name)
+                .ok_or_else(|| anyhow!("section {name} is not exist"))?;
+            (section.section_base, section.section_size)
+        } else {
+            (0, 0)
+        };
+
+        let search_fn = if reverse {
+            Self::in_reverse_search
+        } else {
+            Self::in_search
+        };
+
+        self.ctx.borrow_mut().last = search_fn(self, &pattern, &mask, base, size)?;
+        self.clear();
+        Ok(self)
     }
 
-    /// reverse search a signature.
+    /// Searches for a signature in the loaded module.
     ///
     /// # Examples
-    /// ```no_run
-    /// let mut sker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = sker.reverse_search("00 ? 00")?;
+    /// ```ignore
+    /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
+    /// let addr = seeker.search("00 ? 00")?
+    ///                  .addr()?;
     /// ```
+    pub fn search(&self, sig: &str) -> Result<&Self> {
+        self.search_internal(sig, false, None)
+    }
+
+    /// Reverse searches for a signature in the loaded module.
     ///
-    pub fn reverse_search(&self, sig: &str) -> Result<usize> {
-        let ctx = self.ctx.borrow();
+    /// # Examples
+    /// ```ignore
+    /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
+    /// let addr = seeker.reverse_search("00 ? 00")?
+    ///                  .addr()?;
+    /// ```
+    pub fn reverse_search(&self, sig: &str) -> Result<&Self> {
+        self.search_internal(sig, true, None)
+    }
 
-        if !ctx.inited {
-            bail!("seeker uninited");
-        }
+    /// Searches for a signature in a specific section of the loaded module.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
+    /// let addr = seeker.search_in_section("00 ? 00", ".text")?
+    ///                  .addr()?;
+    /// ```
+    pub fn search_in_section(&self, sig: &str, name: &str) -> Result<&Self> {
+        self.search_internal(sig, false, Some(name))
+    }
 
-        let (pattern, mask) = Self::sig2raw(sig)?;
-        self.reverse_search_pattern(
-            &pattern,
-            &mask,
-            ctx.module_base + ctx.module_size,
-            ctx.module_size,
-        )
+    /// Reverse searches for a signature in a specific section of the loaded module.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
+    /// let addr = seeker.reverse_search_in_section("00 ? 00", ".text")?
+    ///                  .addr()?;
+    /// ```
+    pub fn reverse_search_in_section(&self, sig: &str, name: &str) -> Result<&Self> {
+        self.search_internal(sig, true, Some(name))
     }
 
     /// search a signature use mask.
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let mut sker = sigmatch::Seeker::with_name("user32.dll")?;
     /// let addr = sker.raw_search( b"\xE8\x00\x00\x00\x00", "x????")?;
     /// ```
     ///
+    #[deprecated]
     pub fn raw_search(&self, pattern: &[u8], mask: &str) -> Result<usize> {
         let ctx = self.ctx.borrow();
-
         if !ctx.inited {
             bail!("seeker uninited");
         }
 
         let m_chars: Vec<char> = mask.chars().collect();
-        self.search_pattern(&pattern, &m_chars, ctx.module_base, ctx.module_size)
+        self.search_pattern(pattern, &m_chars, ctx.module_base, ctx.module_size)
     }
 
-    /// reverse search a signature use mask.
+    /// search a signature use bitmap.
     ///
     /// # Examples
-    /// ```no_run
+    /// ```ignore
     /// let mut sker = sigmatch::Seeker::with_name("user32.dll")?;
-    /// let addr = sker.raw_reverse_search( b"\xE8\x00\x00\x00\x00", "x????")?;
+    /// let addr = sker.raw_search_bitmap( b"\xE8\x00\x00\x00\x00", 0b10000)?;
     /// ```
     ///
-    pub fn raw_reverse_search(&self, pattern: &[u8], mask: &str) -> Result<usize> {
-        let ctx = self.ctx.borrow();
-
-        if !ctx.inited {
-            bail!("seeker uninited");
+    #[deprecated]
+    pub fn raw_search_bitmap(&self, pattern: &[u8], bitmap: usize) -> Result<usize> {
+        if pattern.len() > usize::BITS as usize {
+            bail!(
+                "pattern length {} exceeds bitmap size {}",
+                pattern.len(),
+                usize::BITS
+            );
         }
 
-        let m_chars: Vec<char> = mask.chars().collect();
-        self.reverse_search_pattern(
-            &pattern,
-            &m_chars,
-            ctx.module_base + ctx.module_size,
-            ctx.module_size,
-        )
+        let mut mask = String::with_capacity(pattern.len());
+
+        for i in (0..pattern.len()).rev() {
+            let bit = (bitmap >> i) & 1;
+            mask.push(if bit == 1 { 'x' } else { '?' });
+        }
+
+        #[allow(deprecated)]
+        self.raw_search(pattern, &mask)
+    }
+}
+
+impl Default for Seeker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 // private
 impl Seeker {
+    fn adjust_range(
+        &self,
+        mut start: usize,
+        mut length: usize,
+        reverse: bool,
+    ) -> Result<(usize, usize)> {
+        let ctx = self.ctx.borrow();
+
+        let (ostart, olength) = (start, length);
+
+        // result first
+        if ctx.last != 0 {
+            start = ctx.last;
+            if reverse {
+                start -= ctx.offset;
+            } else {
+                start += ctx.offset;
+            }
+            length = ctx.limit;
+        }
+        // start first
+        else if start == 0 {
+            start = ctx.module_base;
+            length = ctx.module_size;
+        }
+
+        if length == 0 {
+            length = start - if ostart == 0 { ctx.module_base } else { ostart };
+
+            if !reverse {
+                length = if olength == 0 {
+                    ctx.module_size
+                } else {
+                    olength
+                } - length;
+            }
+        }
+
+        if start == 0 || length == 0 {
+            bail!("invalid adjust_range")
+        }
+
+        if ctx.limit != 0 && ctx.limit < length {
+            length = ctx.limit;
+        }
+
+        Ok((start, length))
+    }
+
+    fn clear(&self) {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.limit = 0;
+        ctx.offset = 0;
+    }
+
+    fn reset(&self) {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.last = 0;
+        ctx.limit = 0;
+        ctx.offset = 0;
+    }
+
+    fn in_search(
+        &self,
+        pattern: &[u8],
+        mask: &[char],
+        start: usize,
+        length: usize,
+    ) -> Result<usize> {
+        if pattern.is_empty() || mask.is_empty() {
+            self.reset();
+            bail!(std::format!(
+                "invalid pattern({}) or mask({})",
+                pattern.len(),
+                mask.len()
+            ))
+        }
+
+        let (start, length) = self
+            .adjust_range(start, length, false)
+            .inspect_err(|_| self.reset())?;
+
+        self.search_pattern(pattern, mask, start, length)
+            .inspect_err(|_| self.reset())
+    }
+
+    fn in_reverse_search(
+        &self,
+        pattern: &[u8],
+        mask: &[char],
+        start: usize,
+        length: usize,
+    ) -> Result<usize> {
+        if pattern.is_empty() || mask.is_empty() {
+            self.reset();
+            bail!(std::format!(
+                "invalid pattern({}) or mask({})",
+                pattern.len(),
+                mask.len()
+            ))
+        }
+
+        let (start, length) = self.adjust_range(start, length, true).inspect_err(|_| {
+            self.reset();
+        })?;
+
+        self.reverse_search_pattern(pattern, mask, start, length)
+            .inspect_err(|_| {
+                self.reset();
+            })
+    }
+
     fn search_pattern(
         &self,
         pattern: &[u8],
@@ -400,10 +650,11 @@ impl Seeker {
         start: usize,
         length: usize,
     ) -> Result<usize> {
-        let fixlen = length.saturating_sub(pattern.len());
-        if fixlen == 0 {
+        let Some(fixlen) = length.checked_sub(pattern.len()) else {
             bail!("src len < pattern len");
-        }
+        };
+
+        debug!("search_pattern {start:08X} {fixlen:08X}");
 
         let ctx = self.ctx.borrow();
         let base_index = INDEX!(ctx.module_base, self.page_shift);
@@ -440,10 +691,11 @@ impl Seeker {
         start: usize,
         length: usize,
     ) -> Result<usize> {
-        let fixlen = length.saturating_sub(pattern.len());
-        if fixlen == 0 {
+        let Some(fixlen) = length.checked_sub(pattern.len()) else {
             bail!("src len < pattern len");
-        }
+        };
+
+        debug!("reverse_search_pattern {start:08X} {fixlen:08X}");
         let ctx = self.ctx.borrow();
 
         let base_index = INDEX!(ctx.module_base, self.page_shift);
@@ -485,7 +737,7 @@ impl Seeker {
     }
 
     fn get_page_shift(page_size: usize) -> u8 {
-        for shift in 0..=64 as u8 {
+        for shift in 0..=64_u8 {
             if 1 << shift == page_size {
                 return shift;
             }
@@ -499,7 +751,7 @@ impl Seeker {
         let r = regex::Regex::new("[0-9a-fA-F]{2}|\\?{1,2}").unwrap();
         for s in r.find_iter(sig) {
             let s = s.as_str();
-            if s.chars().next().unwrap() == '?' {
+            if s.starts_with('?') {
                 pattern.push(0);
                 mask.push('?');
             } else {

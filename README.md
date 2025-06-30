@@ -2,12 +2,21 @@
 
 A memory signature search library for the Windows platform written in Rust.
 
-It's a basic version migrated from another C++ project of mine, with more features coming soon!
 
 [![Crates.io](https://img.shields.io/crates/v/sigmatch)](https://crates.io/crates/sigmatch)
 [![Crates.io](https://img.shields.io/crates/l/sigmatch)](https://github.com/piz-ewing/sigmatch)
 [![depstatus](https://deps.rs/repo/github/piz-ewing/sigmatch/status.svg)](https://deps.rs/repo/github/piz-ewing/sigmatch)
 [![Crates.io](https://img.shields.io/crates/d/sigmatch)](https://github.com/piz-ewing/sigmatch)
+
+
+## Features
+- 🧩 **Fluent API**: Clear, logical calls for complex search workflows.
+- ✨ **Ergonomic**: Ready to use, supports multiple signature formats.
+- 🛡️ **Robust Errors**: Based on `anyhow`, rich context, panic-free.
+- 🧱 **Safe Memory**: Auto skips inaccessible regions for stable scans.
+- 🚀 **Extreme Performance**: Fast and stable by design.
+- 🧪 **Optimized & Tested**: Actively tested, continually improved.
+
 
 ## Quick Use
 
@@ -82,13 +91,24 @@ fn example() -> Result<()> {
 }
 ```
 
-## What's New
-- Method chaining is now supported
-- Section-based signature scanning added
-- Added support for `limit` and `offset` in search
-- Unit test coverage improved
-- Project structure reorganized for better clarity
+## Recent
 
-## Examples
+- Added support for method chaining
+- Introduced section-based signature scanning
+- Added `limit()` and `offset()` methods to control search behavior
+- Improved unit test coverage
+- Reorganized project structure for better clarity
 
-More than examples can see [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).
+
+## Planned Features
+
+- [ ] Cross-platform support (Linux, macOS, etc.)
+- [ ] Multi-threaded scanning for performance
+- [ ] Expanded and more comprehensive test coverage
+
+
+## Examples & Issues
+
+- See more examples in the [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples) directory.
+- Report bugs or suggestions via [issues](https://github.com/piz-ewing/sigmatch/issues).
+

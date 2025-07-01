@@ -12,7 +12,7 @@ A memory signature search library for the Windows platform written in Rust.
 ## Features
 - 🧩 **Fluent API**: Clear, logical calls for complex search workflows.
 - ✨ **Ergonomic**: Ready to use, supports multiple signature formats.
-- 🛡️ **Robust Errors**: Based on `anyhow`, rich context, panic-free.
+- 🛡️ **Robust Errors**: Based on `thiserror`, rich context, panic-free.
 - 🧱 **Safe Memory**: Auto skips inaccessible regions for stable scans.
 - 🚀 **Extreme Performance**: Fast and stable by design.
 - 🧪 **Optimized & Tested**: Actively tested, continually improved.
@@ -102,6 +102,7 @@ fn example() -> Result<()> {
 
 ## Planned Features
 
+- [ ] Support reference search
 - [ ] Cross-platform support (Linux, macOS, etc.)
 - [ ] Multi-threaded scanning for performance
 - [ ] Expanded and more comprehensive test coverage

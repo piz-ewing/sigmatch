@@ -72,9 +72,8 @@
 //! More than examples can see:
 //! [examples](https://github.com/piz-ewing/sigmatch/tree/main/examples).
 //!
-pub use anyhow::{anyhow, bail, Context, Error, Result};
 use custom_debug::Debug;
-use log::debug;
+use log::{debug, warn};
 use std::{cell::RefCell, collections::HashMap, fmt};
 
 #[cfg(target_arch = "x86_64")]
@@ -95,6 +94,9 @@ use windows::{
 
 mod str;
 use crate::str::ToPCWSTRWrapper;
+
+mod error;
+pub use error::{Error, Result};
 
 macro_rules! ROUND_UP {
     ($x:expr, $a:expr) => {
@@ -121,6 +123,21 @@ macro_rules! INDEX {
     };
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Direction {
+    Forward,
+    Reverse,
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Direction::Forward => write!(f, "forward"),
+            Direction::Reverse => write!(f, "reverse"),
+        }
+    }
+}
+
 /// Section Information.
 #[derive(Clone)]
 pub struct Section {
@@ -140,6 +157,9 @@ struct _Seeker {
     /// The base address of the module.
     #[debug(with = hex_fmt)]
     module_base: usize,
+    /// The end address of the module.
+    #[debug(with = hex_fmt)]
+    module_end: usize,
     /// A map of section names to their corresponding Section structs.
     #[debug(skip)]
     sections: HashMap<String, Section>,
@@ -198,6 +218,7 @@ impl Seeker {
                 module_name: String::new(),
                 module_size: 0,
                 module_base: 0 as _,
+                module_end: 0 as _,
                 sections: HashMap::new(),
 
                 inited: false,
@@ -234,6 +255,9 @@ impl Seeker {
     ///
     /// The setting is reset after the next search operation.
     ///
+    /// In forward searches, the offset is **added** to the start address (typically `last + offset`);
+    /// in reverse searches, the offset is **subtracted** from the start address (i.e. `last - offset`).
+    ///
     /// # Examples
     /// ```ignore
     /// let mut seeker = sigmatch::Seeker::with_name("user32.dll")?;
@@ -259,21 +283,44 @@ impl Seeker {
         self.ctx.borrow().module_size
     }
 
+    pub fn module_end(&self) -> usize {
+        self.ctx.borrow().module_end
+    }
+
     pub fn sections(&self) -> HashMap<String, Section> {
         self.ctx.borrow().sections.clone()
+    }
+
+    pub fn add(&self, value: usize) -> &Self {
+        self.ctx.borrow_mut().last += value;
+        self
+    }
+
+    pub fn sub(&self, value: usize) -> &Self {
+        self.ctx.borrow_mut().last -= value;
+        self
     }
 
     pub fn addr(&self) -> Result<usize> {
         let a = std::mem::take(&mut self.ctx.borrow_mut().last);
         if a == 0 {
-            bail!("invalid addr")
+            Err(Error::InvalidAddr)
+        } else {
+            Ok(a)
         }
-        Ok(a)
     }
 
     pub fn debug(&self) -> &Self {
         let sker = self.ctx.borrow();
         debug!("{sker:?}");
+        self
+    }
+
+    pub unsafe fn unchecked(&self) -> &Self {
+        let mut ctx = self.ctx.borrow_mut();
+        for v in &mut ctx.page_readable {
+            *v = true;
+        }
         self
     }
 
@@ -305,19 +352,19 @@ impl Seeker {
 
         let module_base = if module_name == "main" {
             let Ok(r) = (unsafe { GetModuleHandleW(PCWSTR::null()) }) else {
-                bail!("get main module handle failed");
+                return Err(Error::GetModuleHandleFailed("main".to_string()));
             };
             r
         } else {
             let pcw_module_name = module_name.to_pcwstr();
             let Ok(r) = (unsafe { GetModuleHandleW(pcw_module_name.as_pcwstr()) }) else {
-                bail!("get {} module handle failed", module_name);
+                return Err(Error::GetModuleHandleFailed(module_name.to_string()));
             };
             r
         };
 
         if module_base.is_invalid() {
-            bail!("{} module handle is_invalid", module_name);
+            return Err(Error::GetModuleHandleFailed(module_name.to_string()));
         }
 
         ctx.module_base = module_base.0 as _;
@@ -326,7 +373,7 @@ impl Seeker {
         unsafe {
             let dos_header = ctx.module_base as *const IMAGE_DOS_HEADER;
             if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
-                bail!("{} module dos header invalid", module_name)
+                return Err(Error::InvalidDosHeader(module_name.to_string()));
             }
 
             #[cfg(target_arch = "x86_64")]
@@ -339,13 +386,14 @@ impl Seeker {
                 (ctx.module_base + (*dos_header).e_lfanew as usize) as *const ImageNtHeaders;
 
             if (*nt_header).Signature != IMAGE_NT_SIGNATURE {
-                bail!("{} module nt header invalid", module_name)
+                return Err(Error::InvalidNtHeader(module_name.to_string()));
             }
 
             ctx.module_size = (*nt_header).OptionalHeader.SizeOfImage as _;
             if ctx.module_size == 0 {
-                bail!("{} module_size is zero", module_name)
+                return Err(Error::ModuleSizeZero(module_name.to_string()));
             }
+            ctx.module_end = ctx.module_base + ctx.module_size - 1;
 
             let section_header = (ctx.module_base
                 + (*dos_header).e_lfanew as usize
@@ -372,9 +420,9 @@ impl Seeker {
                     let index = ALIGN!(section_rva, self.page_size) >> self.page_shift;
                     let len = ALIGN!(section_size, self.page_size) >> self.page_shift;
                     for j in index..(index + len) {
-                        let page = ctx.page_readable.get_mut(j).context(format!(
-                            "module {module_name} section {section_name} out of bounds",
-                        ))?;
+                        let Some(page) = ctx.page_readable.get_mut(j) else {
+                            return Err(Error::SectionOutOfBounds(section_name.to_string()));
+                        };
                         *page = true;
                     }
                 }
@@ -396,11 +444,11 @@ impl Seeker {
     fn search_internal(
         &self,
         sig: &str,
-        reverse: bool,
+        direction: Direction,
         section_name: Option<&str>,
     ) -> Result<&Self> {
         if !self.ctx.borrow().inited {
-            bail!("seeker uninited");
+            return Err(Error::Uninitialized);
         }
 
         let (pattern, mask) = Self::sig2raw(sig)?;
@@ -410,16 +458,22 @@ impl Seeker {
             let section = ctx
                 .sections
                 .get(name)
-                .ok_or_else(|| anyhow!("section {name} is not exist"))?;
-            (section.section_base, section.section_size)
+                .ok_or_else(|| Error::SectionNotFound(name.to_string()))?;
+
+            match direction {
+                Direction::Forward => (section.section_base, section.section_size),
+                Direction::Reverse => (
+                    section.section_base + section.section_size - 1,
+                    section.section_size,
+                ),
+            }
         } else {
             (0, 0)
         };
 
-        let search_fn = if reverse {
-            Self::in_reverse_search
-        } else {
-            Self::in_search
+        let search_fn = match direction {
+            Direction::Forward => Self::in_search,
+            Direction::Reverse => Self::in_reverse_search,
         };
 
         self.ctx.borrow_mut().last = search_fn(self, &pattern, &mask, base, size)?;
@@ -436,7 +490,7 @@ impl Seeker {
     ///                  .addr()?;
     /// ```
     pub fn search(&self, sig: &str) -> Result<&Self> {
-        self.search_internal(sig, false, None)
+        self.search_internal(sig, Direction::Forward, None)
     }
 
     /// Reverse searches for a signature in the loaded module.
@@ -448,7 +502,7 @@ impl Seeker {
     ///                  .addr()?;
     /// ```
     pub fn reverse_search(&self, sig: &str) -> Result<&Self> {
-        self.search_internal(sig, true, None)
+        self.search_internal(sig, Direction::Reverse, None)
     }
 
     /// Searches for a signature in a specific section of the loaded module.
@@ -460,7 +514,7 @@ impl Seeker {
     ///                  .addr()?;
     /// ```
     pub fn search_in_section(&self, sig: &str, name: &str) -> Result<&Self> {
-        self.search_internal(sig, false, Some(name))
+        self.search_internal(sig, Direction::Forward, Some(name))
     }
 
     /// Reverse searches for a signature in a specific section of the loaded module.
@@ -472,7 +526,7 @@ impl Seeker {
     ///                  .addr()?;
     /// ```
     pub fn reverse_search_in_section(&self, sig: &str, name: &str) -> Result<&Self> {
-        self.search_internal(sig, true, Some(name))
+        self.search_internal(sig, Direction::Reverse, Some(name))
     }
 
     /// search a signature use mask.
@@ -487,7 +541,7 @@ impl Seeker {
     pub fn raw_search(&self, pattern: &[u8], mask: &str) -> Result<usize> {
         let ctx = self.ctx.borrow();
         if !ctx.inited {
-            bail!("seeker uninited");
+            return Err(Error::Uninitialized);
         }
 
         let m_chars: Vec<char> = mask.chars().collect();
@@ -505,11 +559,10 @@ impl Seeker {
     #[deprecated]
     pub fn raw_search_bitmap(&self, pattern: &[u8], bitmap: usize) -> Result<usize> {
         if pattern.len() > usize::BITS as usize {
-            bail!(
-                "pattern length {} exceeds bitmap size {}",
+            return Err(Error::PatternExceedsBitmapSize(
                 pattern.len(),
-                usize::BITS
-            );
+                usize::BITS as usize,
+            ));
         }
 
         let mut mask = String::with_capacity(pattern.len());
@@ -536,49 +589,89 @@ impl Seeker {
         &self,
         mut start: usize,
         mut length: usize,
-        reverse: bool,
+        direction: Direction,
     ) -> Result<(usize, usize)> {
         let ctx = self.ctx.borrow();
 
-        let (ostart, olength) = (start, length);
+        match (start, length, ctx.last) {
+            (s, l, _) if s != 0 => {
+                if ctx.last != 0 {
+                    warn!("previous search will be ignored");
+                }
 
-        // result first
-        if ctx.last != 0 {
-            start = ctx.last;
-            if reverse {
-                start -= ctx.offset;
-            } else {
-                start += ctx.offset;
+                if l != 0 && ctx.offset >= l {
+                    return Err(Error::OffsetOutOfSection(
+                        start, length, ctx.offset, direction,
+                    ));
+                }
             }
-            length = ctx.limit;
-        }
-        // start first
-        else if start == 0 {
-            start = ctx.module_base;
-            length = ctx.module_size;
-        }
-
-        if length == 0 {
-            length = start - if ostart == 0 { ctx.module_base } else { ostart };
-
-            if !reverse {
-                length = if olength == 0 {
-                    ctx.module_size
-                } else {
-                    olength
-                } - length;
+            (_, _, last) if last != 0 => {
+                start = last;
+            }
+            (0, 0, 0) => {
+                start = ctx.module_base;
+                length = ctx.module_size;
+                if let Direction::Reverse = direction {
+                    start = ctx.module_end;
+                }
+            }
+            _ => {
+                return Err(Error::InvalidAdjustRange);
             }
         }
 
-        if start == 0 || length == 0 {
-            bail!("invalid adjust_range")
-        }
+        // offset
+        start = match direction {
+            Direction::Forward => {
+                length = length.saturating_sub(ctx.offset);
+                start.saturating_add(ctx.offset)
+            }
+            Direction::Reverse => {
+                length = length.saturating_sub(ctx.offset);
+                start.saturating_sub(ctx.offset)
+            }
+        };
 
+        // limit
         if ctx.limit != 0 && ctx.limit < length {
             length = ctx.limit;
         }
 
+        // default length
+        if length == 0 {
+            length = start.saturating_sub(ctx.module_base);
+            if let Direction::Forward = direction {
+                length = ctx.module_size.saturating_sub(length)
+            } else {
+                length += 1;
+            }
+        }
+
+        if !self.is_address_in_module(start, length, direction) {
+            return Err(Error::OffsetOutOfModule(
+                start, length, ctx.offset, direction,
+            ));
+        }
+
         Ok((start, length))
+    }
+
+    fn is_address_in_module(&self, start: usize, length: usize, direction: Direction) -> bool {
+        let ctx = self.ctx.borrow();
+
+        let end = match direction {
+            Direction::Forward => start.checked_add(length.saturating_sub(1)),
+            Direction::Reverse => start.checked_sub(length.saturating_sub(1)),
+        };
+
+        match end {
+            Some(end_addr) => {
+                let base = ctx.module_base;
+                let end = ctx.module_end;
+                start >= base && start <= end && end_addr >= base && end_addr <= end
+            }
+            None => false, // overflow/underflow occurred
+        }
     }
 
     fn clear(&self) {
@@ -603,15 +696,11 @@ impl Seeker {
     ) -> Result<usize> {
         if pattern.is_empty() || mask.is_empty() {
             self.reset();
-            bail!(std::format!(
-                "invalid pattern({}) or mask({})",
-                pattern.len(),
-                mask.len()
-            ))
+            return Err(Error::InvalidPattern(pattern.len(), mask.len()));
         }
 
         let (start, length) = self
-            .adjust_range(start, length, false)
+            .adjust_range(start, length, Direction::Forward)
             .inspect_err(|_| self.reset())?;
 
         self.search_pattern(pattern, mask, start, length)
@@ -627,16 +716,14 @@ impl Seeker {
     ) -> Result<usize> {
         if pattern.is_empty() || mask.is_empty() {
             self.reset();
-            bail!(std::format!(
-                "invalid pattern({}) or mask({})",
-                pattern.len(),
-                mask.len()
-            ))
+            return Err(Error::InvalidPattern(pattern.len(), mask.len()));
         }
 
-        let (start, length) = self.adjust_range(start, length, true).inspect_err(|_| {
-            self.reset();
-        })?;
+        let (start, length) = self
+            .adjust_range(start, length, Direction::Reverse)
+            .inspect_err(|_| {
+                self.reset();
+            })?;
 
         self.reverse_search_pattern(pattern, mask, start, length)
             .inspect_err(|_| {
@@ -652,10 +739,8 @@ impl Seeker {
         length: usize,
     ) -> Result<usize> {
         let Some(fixlen) = length.checked_sub(pattern.len()) else {
-            bail!("src len < pattern len");
+            return Err(Error::SearchLengthTooShort(length, pattern.len()));
         };
-
-        debug!("search_pattern {start:08X} {fixlen:08X}");
 
         let ctx = self.ctx.borrow();
         let base_index = INDEX!(ctx.module_base, self.page_shift);
@@ -663,6 +748,8 @@ impl Seeker {
 
         let mut addr = start;
         let end = start + fixlen;
+
+        debug!("searching signature (forward): start = 0x{start:X}, length = 0x{length:X} fixlen = {fixlen:X} addr = {addr:X} end = {end:X}");
 
         while addr <= end {
             let page_index = INDEX!(addr, self.page_shift);
@@ -682,7 +769,7 @@ impl Seeker {
             addr += 1;
         }
 
-        bail!("search_pattern failed");
+        Err(Error::PatternNotFound)
     }
 
     fn reverse_search_pattern(
@@ -692,18 +779,20 @@ impl Seeker {
         start: usize,
         length: usize,
     ) -> Result<usize> {
-        let Some(fixlen) = length.checked_sub(pattern.len()) else {
-            bail!("src len < pattern len");
+        let pattern_len = pattern.len();
+        if length < pattern_len {
+            return Err(Error::SearchLengthTooShort(length, pattern.len()));
         };
 
-        debug!("reverse_search_pattern {start:08X} {fixlen:08X}");
         let ctx = self.ctx.borrow();
 
         let base_index = INDEX!(ctx.module_base, self.page_shift);
         let mut last_index = 0;
 
-        let mut addr = start - pattern.len();
-        let end = start - fixlen;
+        let mut addr = start - pattern_len + 1;
+        let end = start - length + 1;
+
+        debug!("searching signature (reverse): start = 0x{start:X}, length = 0x{length:X} addr = {addr:X} end = {end:X}");
 
         while addr >= end {
             let page_index = INDEX!(addr, self.page_shift);
@@ -715,7 +804,6 @@ impl Seeker {
                     continue;
                 }
             }
-
             if Self::compare(addr, pattern, mask) {
                 return Ok(addr);
             }
@@ -723,7 +811,7 @@ impl Seeker {
             addr -= 1;
         }
 
-        bail!("reverse_search_pattern failed");
+        Err(Error::PatternNotFound)
     }
 }
 
@@ -757,7 +845,7 @@ impl Seeker {
                 mask.push('?');
             } else {
                 let Ok(b) = u8::from_str_radix(s, 16) else {
-                    bail!("sig is not a valid hex pattern");
+                    return Err(Error::InvalidSigHex);
                 };
 
                 pattern.push(b);

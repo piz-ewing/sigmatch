@@ -1,6 +1,6 @@
 [package]
 name = "sigmatch"
-version = "0.2.3"
+version = "0.2.5"
 edition = "2021"
 description = "A memory signature search library for the Windows platform written in Rust."
 keywords = ["signature", "sigmatch", "sig", "pattern", "sigsearch"]
@@ -13,11 +13,11 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0"
 memoffset = "0.9"
 regex = "1.10"
-custom_debug = "0.6.2"
-log="0.4.27"
+custom_debug = "0.6"
+log="0.4"
+thiserror="2.0"
 
 [dependencies.windows]
 version = "0"
@@ -33,4 +33,5 @@ features = [
 name = "demo"
 
 [dev-dependencies]
-pretty_env_logger = "0.5.0"
+pretty_env_logger = "0.5"
+anyhow = "1.0"

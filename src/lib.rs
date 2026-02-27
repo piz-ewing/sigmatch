@@ -762,6 +762,7 @@ impl Seeker {
                 }
             }
 
+            // FIXME: Cross-page safety protection (2026-02-27) - Prevent signatures from spanning across page boundaries into an unreadable page, causing an AV crash
             if Self::compare(addr, pattern, mask) {
                 return Ok(addr);
             }
@@ -804,6 +805,8 @@ impl Seeker {
                     continue;
                 }
             }
+
+            // FIXME: Cross-page safety protection (2026-02-27) - Prevent signatures from spanning across page boundaries into an unreadable page, causing an AV crash
             if Self::compare(addr, pattern, mask) {
                 return Ok(addr);
             }

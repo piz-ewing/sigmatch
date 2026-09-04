@@ -5,9 +5,6 @@ use crate::Direction;
 /// Error type for sigmatch library.
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("module `{0}` not found")]
-    ModuleNotFound(String),
-
     #[error("failed to get module handle for `{0}`")]
     GetModuleHandleFailed(String),
 
@@ -29,31 +26,47 @@ pub enum Error {
     #[error("seeker is not initialized")]
     Uninitialized,
 
-    #[error("invalid pattern({0}) or mask({1})")]
-    InvalidPattern(usize, usize),
+    #[error("string contains an embedded NUL byte")]
+    InvalidString,
 
-    #[error("search range with offset is out of module bounds: start=0x{0:X}, length=0x{1:X}, offset=0x{2:X}, reverse={3}")]
-    OffsetOutOfModule(usize, usize, usize, Direction),
+    #[error("invalid pattern: pattern length={pattern_len}, mask length={mask_len}")]
+    InvalidPattern { pattern_len: usize, mask_len: usize },
 
-    #[error("search range with offset is out of section bounds: start=0x{0:X}, length=0x{1:X}, offset=0x{2:X}, reverse={3}")]
-    OffsetOutOfSection(usize, usize, usize, Direction),
+    #[error("invalid signature token `{0}`")]
+    InvalidSignatureToken(String),
 
-    #[error("invalid search range")]
-    InvalidAdjustRange,
+    #[error("invalid mask character `{0}`")]
+    InvalidMaskCharacter(char),
 
-    #[error("invalid address result")]
-    InvalidAddr,
-
-    #[error("sig is not a valid hex pattern")]
-    InvalidSigHex,
+    #[error("search start 0x{start:X} is outside {direction} range 0x{low:X}..0x{high:X}")]
+    SearchStartOutOfRange {
+        start: usize,
+        low: usize,
+        high: usize,
+        direction: Direction,
+    },
 
     #[error("pattern length {0} exceeds bitmap bit size limit {1}")]
     PatternExceedsBitmapSize(usize, usize),
 
-    #[error("search length {0} < pattern length {1}")]
-    SearchLengthTooShort(usize, usize),
+    #[error("search length {length} < pattern length {pattern}")]
+    SearchLengthTooShort { length: usize, pattern: usize },
 
-    //
+    #[error("search range requires too many cached pages: {pages}")]
+    SearchRangeTooLarge { pages: usize },
+
+    #[error("invalid reference encoding: field offset=0x{field_offset:X}, instruction size=0x{instruction_size:X}")]
+    InvalidReferenceEncoding {
+        field_offset: usize,
+        instruction_size: usize,
+    },
+
+    #[error("reference query has no candidate pattern")]
+    MissingReferencePattern,
+
+    #[error("reference query has no address encoding")]
+    MissingReferenceEncoding,
+
     #[error("pattern not found")]
     PatternNotFound,
 

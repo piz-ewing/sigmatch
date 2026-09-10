@@ -114,9 +114,12 @@ fn example() -> Result<()> {
 
 Queries are lazy and independent: section and range constraints are applied before scanning, and `first()` or `all()` decides when results are consumed. `find_in(section, pattern)` is a shorthand for a simple forward lookup; use `scan` when direction, byte windows, or iteration need to be explicit.
 
+`string` returns the first occurrence of a literal in a section. A data section can hold the same literal twice while only one of them is referenced, so `strings` enumerates every occurrence in address order and each one starts its own reference query.
+
 
 ## Recent
 
+- Added `Seeker::strings` for enumerating every occurrence of a literal, not just the first.
 - Added the explicit query API with forward, backward, section, and byte-window controls.
 - Added reusable text, masked-byte, and bitmap patterns.
 - Added string reference queries with explicit x86/x64 address decoders.

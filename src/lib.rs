@@ -17,7 +17,7 @@
 //! ```
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-compile_error!("sigmatch 0.3.1 supports only x86 and x86_64 targets");
+compile_error!("sigmatch supports only x86 and x86_64 targets");
 
 use std::{collections::HashMap, fmt, ops::Range, ptr, sync::Arc};
 
@@ -402,20 +402,37 @@ impl Seeker {
     }
 
     /// Locate a NUL-terminated narrow string in one section.
+    ///
+    /// Returns the **first** occurrence. When the literal appears more than
+    /// once, [`strings`](Self::strings) enumerates all of them.
     pub fn string(&self, value: &str, section: &str) -> Result<StringMatch<'_>> {
+        self.strings(value, section)?
+            .next()
+            .ok_or(Error::PatternNotFound)
+    }
+
+    /// Locate every occurrence of a NUL-terminated narrow string in one
+    /// section, in ascending address order.
+    ///
+    /// Anchoring the first occurrence is wrong whenever the referenced
+    /// occurrence is not the first one, and that happens in practice: a data
+    /// section can hold the same literal twice (a name string shared by two
+    /// functions) while only one of them is the operand of the instruction
+    /// being looked for. Iterating lets the caller pick the occurrence that
+    /// matters and hand it to [`StringMatch::refs_in`].
+    pub fn strings(&self, value: &str, section: &str) -> Result<StringMatches<'_>> {
         if value.as_bytes().contains(&0) {
             return Err(Error::InvalidString);
         }
         let mut bytes = value.as_bytes().to_vec();
         bytes.push(0);
-        let address = self
+        let matches = self
             .scan(Pattern::bytes(&bytes)?)?
             .in_section(section)
-            .first()?
-            .address();
-        Ok(StringMatch {
+            .all()?;
+        Ok(StringMatches {
             seeker: self,
-            address,
+            matches,
         })
     }
 
@@ -1018,6 +1035,25 @@ impl<'a> StringMatch<'a> {
     }
 }
 
+/// Every occurrence of a string in one section, in ascending address order.
+/// Each item starts its own reference query.
+pub struct StringMatches<'a> {
+    seeker: &'a Seeker,
+    matches: Matches<'a>,
+}
+
+impl<'a> Iterator for StringMatches<'a> {
+    type Item = StringMatch<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let found = self.matches.next()?;
+        Some(StringMatch {
+            seeker: self.seeker,
+            address: found.address(),
+        })
+    }
+}
+
 pub struct ReferenceQuery<'a> {
     seeker: &'a Seeker,
     target: usize,
@@ -1244,6 +1280,48 @@ mod tests {
         }
     }
 
+    /// 测试用的假模块布局：`.text` 从 0 起，`.rdata` 在 2048 处，各 64 字节，整片
+    /// 内存都在同一个缓冲区里（同一次分配，页属性一致）。
+    const TEXT_LEN: usize = 64;
+    const RDATA_OFFSET: usize = 2048;
+    const RDATA_LEN: usize = 64;
+    const MODULE_LEN: usize = RDATA_OFFSET + RDATA_LEN;
+
+    /// 把一片缓冲区当成一个已加载模块，交给 `Seeker` 扫。这样区间语义能直接测，
+    /// 不用等真实目标模块（steamclient）加载。
+    fn fake_module(bytes: &mut [u8; MODULE_LEN]) -> Seeker {
+        let base = bytes.as_mut_ptr() as usize;
+        let mut sections = HashMap::new();
+        sections.insert(
+            ".text".to_string(),
+            Section {
+                section_base: base,
+                section_size: TEXT_LEN,
+            },
+        );
+        sections.insert(
+            ".rdata".to_string(),
+            Section {
+                section_base: base + RDATA_OFFSET,
+                section_size: RDATA_LEN,
+            },
+        );
+        Seeker {
+            module: Some(ModuleSnapshot {
+                _lease: ModuleLease {
+                    handle: HMODULE::default(),
+                    owned: false,
+                },
+                name: "test".to_string(),
+                base,
+                size: MODULE_LEN,
+                end: base + MODULE_LEN,
+                sections,
+            }),
+            page_size: 4096,
+        }
+    }
+
     #[test]
     fn signature_parser_is_strict_and_supports_both_wildcards() {
         let pattern = Pattern::signature("48 8D ? ?? FF").unwrap();
@@ -1381,8 +1459,9 @@ mod tests {
 
     #[test]
     fn references_filter_targets_and_keep_query_state_explicit() {
-        let mut bytes = vec![0x90u8; 64];
-        let base = bytes.as_mut_ptr() as usize;
+        let mut bytes = [0x90u8; MODULE_LEN];
+        let seeker = fake_module(&mut bytes);
+        let base = seeker.module_base();
         let target = base + 40;
         let first_target = base + 30;
         let first_disp = (first_target as isize - (base as isize + 5)) as i32;
@@ -1392,28 +1471,6 @@ mod tests {
         bytes[10] = 0xE8;
         bytes[11..15].copy_from_slice(&target_disp.to_le_bytes());
 
-        let mut sections = HashMap::new();
-        sections.insert(
-            ".text".to_string(),
-            Section {
-                section_base: base,
-                section_size: bytes.len(),
-            },
-        );
-        let seeker = Seeker {
-            module: Some(ModuleSnapshot {
-                _lease: ModuleLease {
-                    handle: HMODULE::default(),
-                    owned: false,
-                },
-                name: "test".to_string(),
-                base,
-                size: bytes.len(),
-                end: base + bytes.len(),
-                sections,
-            }),
-            page_size: 4096,
-        };
         let string = StringMatch {
             seeker: &seeker,
             address: target,
@@ -1430,6 +1487,82 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].address(), base + 10);
         assert_eq!(refs[0].target(), target);
+    }
+
+    /// `.text` 里所有的 `call rel32`（`E8`）中，指向 `string` 的那些。
+    fn calls_to(string: StringMatch<'_>) -> Vec<usize> {
+        string
+            .refs_in(".text")
+            .matching("E8 ?? ?? ?? ??")
+            .using(ReferenceEncoding::Rel32 {
+                displacement_offset: 1,
+                instruction_size: 5,
+            })
+            .all()
+            .unwrap()
+            .map(|reference| reference.address())
+            .collect()
+    }
+
+    /// `.rdata` 里那个字面量的两处出现（各含结尾 NUL）。
+    const LABEL: &[u8] = b"label\0";
+    const FIRST_OFFSET: usize = 8;
+    const SECOND_OFFSET: usize = 40;
+
+    /// 把 `LABEL` 写进 `.rdata` 的两处位置，返回这两处的地址。
+    fn write_labels(bytes: &mut [u8; MODULE_LEN], base: usize) -> (usize, usize) {
+        let rdata = &mut bytes[RDATA_OFFSET..RDATA_OFFSET + RDATA_LEN];
+        for offset in [FIRST_OFFSET, SECOND_OFFSET] {
+            rdata[offset..offset + LABEL.len()].copy_from_slice(LABEL);
+        }
+        (
+            base + RDATA_OFFSET + FIRST_OFFSET,
+            base + RDATA_OFFSET + SECOND_OFFSET,
+        )
+    }
+
+    /// `strings` 给全，`string` 只给第一处。
+    #[test]
+    fn strings_enumerates_every_occurrence_in_order() {
+        let mut bytes = [0x80u8; MODULE_LEN];
+        let seeker = fake_module(&mut bytes);
+        let (first, second) = write_labels(&mut bytes, seeker.module_base());
+
+        let found: Vec<_> = seeker
+            .strings("label", ".rdata")
+            .unwrap()
+            .map(StringMatch::address)
+            .collect();
+        assert_eq!(found, vec![first, second]);
+
+        assert_eq!(
+            seeker.string("label", ".rdata").unwrap().address(),
+            first
+        );
+    }
+
+    /// `strings` 存在的理由：字面量出现两次，被引用的只有**后**一处。这时
+    /// `string` 永远锚在第一处，追不到任何引用——`refs_in` 只在目标完全相同时才
+    /// 算命中，于是调用方看到的是"模式没找到"，而真实原因是找错了那一处。
+    #[test]
+    fn a_reference_query_can_anchor_a_later_occurrence() {
+        let mut bytes = [0x80u8; MODULE_LEN];
+        let seeker = fake_module(&mut bytes);
+        let base = seeker.module_base();
+        let (first, second) = write_labels(&mut bytes, base);
+
+        // 只往第二处写一条 `call rel32`：`.text` 偏移 4 处一个 `E8`，第一处无人引用。
+        let call_site = base + 4;
+        let displacement = (second as isize - (call_site as isize + 5)) as i32;
+        bytes[4] = 0xE8;
+        bytes[5..9].copy_from_slice(&displacement.to_le_bytes());
+
+        assert_eq!(seeker.string("label", ".rdata").unwrap().address(), first);
+        assert!(calls_to(seeker.string("label", ".rdata").unwrap()).is_empty());
+
+        let last = seeker.strings("label", ".rdata").unwrap().last().unwrap();
+        assert_eq!(last.address(), second);
+        assert_eq!(calls_to(last), vec![call_site]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Executable example for the 0.3.1 query API.
+//! Executable example for the 0.3 query API.
 
 use anyhow::{anyhow, Result};
 use log::info;

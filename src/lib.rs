@@ -16,6 +16,8 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 compile_error!("sigmatch supports only x86 and x86_64 targets");
 
@@ -55,7 +57,9 @@ pub use error::{Error, Result};
 /// address is the end of an instruction or basic block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
+    /// Search from low addresses to high.
     Forward,
+    /// Search from high addresses to low.
     Backward,
 }
 
@@ -71,24 +75,32 @@ impl fmt::Display for Direction {
 /// A loaded PE section range. The end address is exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Section {
+    /// Address of the first byte of the section in the loaded module.
     pub section_base: usize,
+    /// Section length in bytes. The loader can map more than the raw data
+    /// holds, so this is the larger of `VirtualSize` and `SizeOfRawData`.
     pub section_size: usize,
 }
 
 impl Section {
+    /// End address, or `None` when base plus size overflows `usize`.
     pub fn end(self) -> Option<usize> {
         self.section_base.checked_add(self.section_size)
     }
 
+    /// Section as `base..end`, or `None` when the end overflows.
     pub fn range(self) -> Option<Range<usize>> {
         Some(self.section_base..self.end()?)
     }
 
+    /// True when `address` is inside the section.
     pub fn contains(self, address: usize) -> bool {
         self.end()
             .is_some_and(|end| address >= self.section_base && address < end)
     }
 
+    /// True when the `length` bytes starting at `address` fit inside the
+    /// section.
     pub fn contains_range(self, address: usize, length: usize) -> bool {
         address >= self.section_base
             && address
@@ -167,10 +179,13 @@ impl Pattern {
         Self::from_parts(bytes.to_vec(), mask)
     }
 
+    /// Number of bytes in the pattern, wildcards included.
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
 
+    /// Always `false`. `from_parts` rejects empty patterns, so this only
+    /// exists to satisfy `clippy::len_without_is_empty`.
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
@@ -222,6 +237,7 @@ impl Pattern {
 
 /// Values accepted by `Seeker::scan` and `ReferenceQuery::matching`.
 pub trait IntoPattern {
+    /// Parse or convert the value. Each query calls this once.
     fn into_pattern(self) -> Result<Pattern>;
 }
 
@@ -317,6 +333,8 @@ pub struct Seeker {
 }
 
 impl Seeker {
+    /// Create a seeker with no module attached. Call `bind` or `with_name`
+    /// before running a query.
     pub fn new() -> Self {
         Self {
             module: None,
@@ -324,6 +342,7 @@ impl Seeker {
         }
     }
 
+    /// Bind to a loaded module by name. `"main"` means the main executable.
     pub fn with_name(name: &str) -> Result<Self> {
         let mut seeker = Self::new();
         seeker.bind(name)?;
@@ -353,10 +372,12 @@ impl Seeker {
         Ok(self)
     }
 
+    /// Base address of the bound module, or 0 when nothing is bound.
     pub fn module_base(&self) -> usize {
         self.module.as_ref().map_or(0, |module| module.base)
     }
 
+    /// Image size from the PE optional header, or 0 when nothing is bound.
     pub fn module_size(&self) -> usize {
         self.module.as_ref().map_or(0, |module| module.size)
     }
@@ -366,16 +387,19 @@ impl Seeker {
         self.module.as_ref().map_or(0, |module| module.end)
     }
 
+    /// Base and end of the bound module, or `None` when nothing is bound.
     pub fn module_range(&self) -> Option<Range<usize>> {
         self.module.as_ref().map(|module| module.base..module.end)
     }
 
+    /// Name passed to `bind`, or an empty string when nothing is bound.
     pub fn module_name(&self) -> String {
         self.module
             .as_ref()
             .map_or_else(String::new, |module| module.name.clone())
     }
 
+    /// Copy of the section table, keyed by the name in the PE header.
     pub fn sections(&self) -> HashMap<String, Section> {
         self.module
             .as_ref()
@@ -465,11 +489,16 @@ enum Scope {
 }
 
 impl<'a> Scan<'a> {
+    /// Limit the query to one section. The name has to match the PE section
+    /// header, and an unknown name makes the query fail with
+    /// `SectionNotFound`.
     pub fn in_section(mut self, name: impl Into<String>) -> Self {
         self.scope = Scope::Section(name.into());
         self
     }
 
+    /// Start at `start` and move toward higher addresses. Without this call a
+    /// forward query starts at the section or module base.
     pub fn forward_from(mut self, start: usize) -> Self {
         self.direction = Direction::Forward;
         self.start = Some(start);
@@ -490,11 +519,13 @@ impl<'a> Scan<'a> {
         self
     }
 
+    /// Run the query and return the first match, or `PatternNotFound`.
     pub fn first(self) -> Result<Match> {
         let mut matches = self.all()?;
         matches.next().ok_or(Error::PatternNotFound)
     }
 
+    /// Run the query and return every match in scan order.
     pub fn all(self) -> Result<Matches<'a>> {
         let prepared = self.prepare(self.pattern.len())?;
         Ok(Matches {
@@ -562,15 +593,19 @@ impl<'a> Scan<'a> {
 /// A single byte-pattern match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Match {
+    /// Address of the first byte of the match.
     pub address: usize,
 }
 
 impl Match {
+    /// Address of the match.
     pub fn address(self) -> usize {
         self.address
     }
 }
 
+/// Iterator over every match. Results arrive in the order the query scans,
+/// so a backward query yields descending addresses.
 pub struct Matches<'a> {
     pattern: Pattern,
     iter: CandidateIter,
@@ -934,16 +969,23 @@ fn protection_is_readable(
 pub enum ReferenceEncoding {
     /// x86-64 RIP-relative memory operand: next instruction + signed rel32.
     X64RipRel32 {
+        /// Offset of the rel32 field from the start of the instruction.
         displacement_offset: usize,
+        /// Length of the whole instruction in bytes.
         instruction_size: usize,
     },
     /// x86/x64 relative branch or call: next instruction + signed rel32.
     Rel32 {
+        /// Offset of the rel32 field from the start of the instruction.
         displacement_offset: usize,
+        /// Length of the whole instruction in bytes.
         instruction_size: usize,
     },
     /// x86 absolute 32-bit operand.
-    X86Abs32 { operand_offset: usize },
+    X86Abs32 {
+        /// Offset of the operand from the start of the instruction.
+        operand_offset: usize,
+    },
 }
 
 impl ReferenceEncoding {
@@ -1020,10 +1062,12 @@ pub struct StringMatch<'a> {
 }
 
 impl<'a> StringMatch<'a> {
+    /// Address of the matched string.
     pub fn address(self) -> usize {
         self.address
     }
 
+    /// Search `section` for instructions whose operand points at this string.
     pub fn refs_in(self, section: &str) -> ReferenceQuery<'a> {
         ReferenceQuery {
             seeker: self.seeker,
@@ -1054,6 +1098,8 @@ impl<'a> Iterator for StringMatches<'a> {
     }
 }
 
+/// A reference search. It scans one section for instructions whose operand
+/// resolves to a fixed target address.
 pub struct ReferenceQuery<'a> {
     seeker: &'a Seeker,
     target: usize,
@@ -1070,16 +1116,20 @@ impl<'a> ReferenceQuery<'a> {
         self
     }
 
+    /// Set the decoder that turns a candidate instruction into a target
+    /// address. A query without one fails with `MissingReferenceEncoding`.
     pub fn using(mut self, encoding: ReferenceEncoding) -> Self {
         self.encoding = Some(encoding);
         self
     }
 
+    /// Run the query and return the first reference, or `PatternNotFound`.
     pub fn first(self) -> Result<Reference> {
         let mut refs = self.all()?;
         refs.next().ok_or(Error::PatternNotFound)
     }
 
+    /// Run the query and return every reference that resolves to the target.
     pub fn all(self) -> Result<References<'a>> {
         let pattern = self.pattern.ok_or(Error::MissingReferencePattern)??;
         let encoding = self.encoding.ok_or(Error::MissingReferenceEncoding)?;
@@ -1098,22 +1148,28 @@ impl<'a> ReferenceQuery<'a> {
     }
 }
 
+/// An instruction that points at the queried target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reference {
+    /// Address of the instruction.
     pub address: usize,
+    /// Address the instruction resolves to.
     pub target: usize,
 }
 
 impl Reference {
+    /// Address of the instruction.
     pub fn address(self) -> usize {
         self.address
     }
 
+    /// Address the instruction resolves to.
     pub fn target(self) -> usize {
         self.target
     }
 }
 
+/// Iterator over the references that matched the target.
 pub struct References<'a> {
     matches: Matches<'a>,
     target: usize,
@@ -1280,15 +1336,16 @@ mod tests {
         }
     }
 
-    /// 测试用的假模块布局：`.text` 从 0 起，`.rdata` 在 2048 处，各 64 字节，整片
-    /// 内存都在同一个缓冲区里（同一次分配，页属性一致）。
+    /// Layout of the fake module. `.text` starts at offset 0, `.rdata` at
+    /// 2048, and each is 64 bytes. Both sit in one buffer, so they share one
+    /// allocation and the same page attributes.
     const TEXT_LEN: usize = 64;
     const RDATA_OFFSET: usize = 2048;
     const RDATA_LEN: usize = 64;
     const MODULE_LEN: usize = RDATA_OFFSET + RDATA_LEN;
 
-    /// 把一片缓冲区当成一个已加载模块，交给 `Seeker` 扫。这样区间语义能直接测，
-    /// 不用等真实目标模块（steamclient）加载。
+    /// Wrap a buffer in a `Seeker` so the range rules can be tested without
+    /// loading a real target module.
     fn fake_module(bytes: &mut [u8; MODULE_LEN]) -> Seeker {
         let base = bytes.as_mut_ptr() as usize;
         let mut sections = HashMap::new();
@@ -1489,7 +1546,7 @@ mod tests {
         assert_eq!(refs[0].target(), target);
     }
 
-    /// `.text` 里所有的 `call rel32`（`E8`）中，指向 `string` 的那些。
+    /// Every `call rel32` (`E8`) in `.text` whose target is `string`.
     fn calls_to(string: StringMatch<'_>) -> Vec<usize> {
         string
             .refs_in(".text")
@@ -1504,12 +1561,12 @@ mod tests {
             .collect()
     }
 
-    /// `.rdata` 里那个字面量的两处出现（各含结尾 NUL）。
+    /// Both copies of the literal in `.rdata`, each including the trailing NUL.
     const LABEL: &[u8] = b"label\0";
     const FIRST_OFFSET: usize = 8;
     const SECOND_OFFSET: usize = 40;
 
-    /// 把 `LABEL` 写进 `.rdata` 的两处位置，返回这两处的地址。
+    /// Write `LABEL` into both slots and return their addresses.
     fn write_labels(bytes: &mut [u8; MODULE_LEN], base: usize) -> (usize, usize) {
         let rdata = &mut bytes[RDATA_OFFSET..RDATA_OFFSET + RDATA_LEN];
         for offset in [FIRST_OFFSET, SECOND_OFFSET] {
@@ -1521,7 +1578,7 @@ mod tests {
         )
     }
 
-    /// `strings` 给全，`string` 只给第一处。
+    /// `strings` returns both copies, `string` only the first.
     #[test]
     fn strings_enumerates_every_occurrence_in_order() {
         let mut bytes = [0x80u8; MODULE_LEN];
@@ -1541,9 +1598,11 @@ mod tests {
         );
     }
 
-    /// `strings` 存在的理由：字面量出现两次，被引用的只有**后**一处。这时
-    /// `string` 永远锚在第一处，追不到任何引用——`refs_in` 只在目标完全相同时才
-    /// 算命中，于是调用方看到的是"模式没找到"，而真实原因是找错了那一处。
+    /// Why `strings` exists. The literal appears twice and only the second
+    /// copy is referenced. `string` always anchors the first copy, so the
+    /// reference query never hits: `refs_in` counts a match only when the
+    /// target is exact, and the caller sees `PatternNotFound` while the real
+    /// problem is the wrong copy.
     #[test]
     fn a_reference_query_can_anchor_a_later_occurrence() {
         let mut bytes = [0x80u8; MODULE_LEN];
@@ -1551,7 +1610,8 @@ mod tests {
         let base = seeker.module_base();
         let (first, second) = write_labels(&mut bytes, base);
 
-        // 只往第二处写一条 `call rel32`：`.text` 偏移 4 处一个 `E8`，第一处无人引用。
+        // One `call rel32` to the second copy: an `E8` at `.text` offset 4.
+        // Nothing references the first copy.
         let call_site = base + 4;
         let displacement = (second as isize - (call_site as isize + 5)) as i32;
         bytes[4] = 0xE8;

@@ -38,11 +38,7 @@ use windows::{
         System::{
             Diagnostics::Debug::IMAGE_SECTION_HEADER,
             LibraryLoader::{GetModuleHandleExW, GetModuleHandleW},
-            Memory::{
-                VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ,
-                PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
-                PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
-            },
+            Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION},
             SystemInformation::{GetSystemInfo, SYSTEM_INFO},
             SystemServices::{IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE},
         },
@@ -50,7 +46,10 @@ use windows::{
 };
 
 mod error;
+mod page_protection;
+
 pub use error::{Error, Result};
+use page_protection::region_is_readable;
 
 /// Search direction. A backward query treats its start as the high end of the
 /// inclusive scan window, which makes `backward_from(address)` useful when the
@@ -209,10 +208,12 @@ impl Pattern {
         })
     }
 
-    fn matches(&self, reader: &ReadContext, address: usize) -> bool {
-        if !reader.range_readable(address, self.len()) {
-            return false;
-        }
+    /// Compare at `address` without checking readability.
+    ///
+    /// # Safety
+    /// `address..address + self.len()` must contain initialized, readable bytes
+    /// that remain valid and are not concurrently modified during the call.
+    unsafe fn compare(&self, address: usize) -> bool {
         if let Some((index, byte)) = self.anchor {
             let Some(anchor_address) = address.checked_add(index) else {
                 return false;
@@ -232,6 +233,12 @@ impl Pattern {
                         ptr::read_unaligned(address as *const u8) == byte
                     })
             })
+    }
+
+    fn matches(&self, reader: &ReadContext, address: usize) -> bool {
+        // SAFETY: The page cache validates the entire span before comparison;
+        // the scan requires the underlying memory to remain valid.
+        reader.range_readable(address, self.len()) && unsafe { self.compare(address) }
     }
 }
 
@@ -582,8 +589,7 @@ impl<'a> Scan<'a> {
             readable_high,
         )?);
         Ok(PreparedScan {
-            low: range.low,
-            high: range.high,
+            runs: readable_runs(&reader, range.low, range.high).into(),
             direction: range.direction,
             reader,
         })
@@ -616,8 +622,16 @@ impl Iterator for Matches<'_> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(address) = self.iter.next_address() {
-            if self.pattern.matches(&self.iter.reader, address) {
+        let len = self.pattern.len();
+        while let Some((address, run)) = self.iter.next_address() {
+            let hit = if self.iter.span_is_readable(run, address, len) {
+                // SAFETY: The candidate belongs to this readable run and its
+                // entire pattern fits before the run's limit.
+                unsafe { self.pattern.compare(address) }
+            } else {
+                self.pattern.matches(&self.iter.reader, address)
+            };
+            if hit {
                 return Some(Match { address });
             }
         }
@@ -693,64 +707,165 @@ fn resolve_bounds(
 }
 
 struct PreparedScan {
-    low: usize,
-    high: usize,
+    runs: Arc<[Run]>,
     direction: Direction,
     reader: Arc<ReadContext>,
 }
 
+/// A stretch of candidate addresses whose bytes are readable, plus the first
+/// address past the readable bytes. A pattern that ends at or before `limit`
+/// can be compared without asking the page cache again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Run {
+    low: usize,
+    high: usize,
+    limit: usize,
+}
+
 struct CandidateIter {
     current: Option<usize>,
-    high: usize,
+    /// Bounds of the run holding `current`, copied out so the per-candidate
+    /// check reads a register instead of going through the slice.
+    run: Run,
+    index: usize,
+    runs: Arc<[Run]>,
     direction: Direction,
     reader: Arc<ReadContext>,
 }
 
 impl CandidateIter {
     fn new(prepared: PreparedScan) -> Self {
-        let current = Some(match prepared.direction {
-            Direction::Forward => prepared.low,
-            Direction::Backward => prepared.high,
-        });
+        let (index, run, current) = match prepared.direction {
+            Direction::Forward => match prepared.runs.first() {
+                Some(run) => (0, *run, Some(run.low)),
+                None => (
+                    0,
+                    Run {
+                        low: 0,
+                        high: 0,
+                        limit: 0,
+                    },
+                    None,
+                ),
+            },
+            Direction::Backward => {
+                let index = prepared.runs.len().saturating_sub(1);
+                match prepared.runs.last() {
+                    Some(run) => (index, *run, Some(run.high)),
+                    None => (
+                        0,
+                        Run {
+                            low: 0,
+                            high: 0,
+                            limit: 0,
+                        },
+                        None,
+                    ),
+                }
+            }
+        };
         Self {
             current,
-            high: match prepared.direction {
-                Direction::Forward => prepared.high,
-                Direction::Backward => prepared.low,
-            },
+            run,
+            index,
+            runs: prepared.runs,
             direction: prepared.direction,
             reader: prepared.reader,
         }
     }
 
-    fn next_address(&mut self) -> Option<usize> {
+    /// Yield the next candidate with the run it belongs to. The run travels
+    /// with the address because stepping past the end of a run switches
+    /// `self.run` before the call returns, and the span check must use the run
+    /// that actually holds `address`.
+    fn next_address(&mut self) -> Option<(usize, Run)> {
         let address = self.current?;
+        let run = self.run;
         let at_end = match self.direction {
-            Direction::Forward if address <= self.high => address == self.high,
-            Direction::Backward if address >= self.high => address == self.high,
-            _ => {
-                self.current = None;
-                return None;
-            }
+            Direction::Forward => address >= self.run.high,
+            Direction::Backward => address <= self.run.low,
         };
         self.current = if at_end {
-            None
+            match self.direction {
+                Direction::Forward => {
+                    self.index += 1;
+                    self.runs.get(self.index).map(|run| {
+                        self.run = *run;
+                        run.low
+                    })
+                }
+                Direction::Backward => {
+                    if self.index == 0 {
+                        None
+                    } else {
+                        self.index -= 1;
+                        self.run = self.runs[self.index];
+                        Some(self.run.high)
+                    }
+                }
+            }
         } else {
             match self.direction {
                 Direction::Forward => address.checked_add(1),
                 Direction::Backward => address.checked_sub(1),
             }
         };
-        Some(address)
+        Some((address, run))
     }
+
+    /// True when `len` bytes starting at `address` stay inside the readable
+    /// stretch of `run`.
+    fn span_is_readable(&self, run: Run, address: usize, len: usize) -> bool {
+        address.checked_add(len).is_some_and(|end| end <= run.limit)
+    }
+}
+
+/// Group the candidate window into stretches of readable pages. `low` and
+/// `high` are candidate addresses, so a run is clipped to them while `limit`
+/// keeps the end of the last readable page, which is what the span check needs.
+fn readable_runs(reader: &ReadContext, low: usize, high: usize) -> Vec<Run> {
+    let mut runs = Vec::new();
+    let mut open: Option<Run> = None;
+    let mut page_low = align_down(low, reader.page_size);
+    loop {
+        let page_high = page_low.saturating_add(reader.page_size - 1);
+        if reader.page_readable(page_low) {
+            let run_low = page_low.max(low);
+            let run_high = page_high.min(high);
+            let limit = page_high.saturating_add(1);
+            match open {
+                Some(mut run) if run.high.checked_add(1) == Some(run_low) => {
+                    run.high = run_high;
+                    run.limit = limit;
+                    open = Some(run);
+                }
+                _ => {
+                    if let Some(run) = open.take() {
+                        runs.push(run);
+                    }
+                    open = Some(Run {
+                        low: run_low,
+                        high: run_high,
+                        limit,
+                    });
+                }
+            }
+        } else if let Some(run) = open.take() {
+            runs.push(run);
+        }
+        match page_high.checked_add(1) {
+            Some(next) if page_high < high => page_low = next,
+            _ => break,
+        }
+    }
+    if let Some(run) = open {
+        runs.push(run);
+    }
+    runs
 }
 
 fn allocation_matches(info: &MEMORY_BASIC_INFORMATION, module_base: usize) -> bool {
     info.AllocationBase as usize == module_base
-}
-
-fn region_is_readable(info: &MEMORY_BASIC_INFORMATION) -> bool {
-    info.State == MEM_COMMIT && protection_is_readable(info.Protect)
 }
 
 fn next_region_end(info: &MEMORY_BASIC_INFORMATION, current: usize) -> Option<usize> {
@@ -822,6 +937,7 @@ struct ReadContext {
     module_end: usize,
     page_base: usize,
     page_size: usize,
+    page_shift: u32,
     readable: Arc<[bool]>,
 }
 
@@ -875,15 +991,14 @@ impl ReadContext {
             module_end,
             page_base,
             page_size,
+            page_shift: page_size.trailing_zeros(),
             readable: readable.into(),
         })
     }
 
     fn page_index(&self, address: usize) -> Option<usize> {
-        address
-            .checked_sub(self.page_base)?
-            .checked_div(self.page_size)
-            .filter(|&index| index < self.readable.len())
+        let index = address.checked_sub(self.page_base)? >> self.page_shift;
+        (index < self.readable.len()).then_some(index)
     }
 
     fn page_readable(&self, address: usize) -> bool {
@@ -945,23 +1060,6 @@ fn page_count(range_low: usize, range_high: usize, page_size: usize) -> usize {
         .and_then(|span| span.checked_div(page_size))
         .and_then(|pages| pages.checked_add(1))
         .unwrap_or(0)
-}
-
-fn protection_is_readable(
-    protection: windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS,
-) -> bool {
-    if protection.contains(PAGE_GUARD) || protection.contains(PAGE_NOACCESS) {
-        return false;
-    }
-    matches!(
-        protection.0 & 0xff,
-        value if value == PAGE_READONLY.0
-            || value == PAGE_READWRITE.0
-            || value == PAGE_WRITECOPY.0
-            || value == PAGE_EXECUTE_READ.0
-            || value == PAGE_EXECUTE_READWRITE.0
-            || value == PAGE_EXECUTE_WRITECOPY.0
-    )
 }
 
 /// How a matched instruction encodes its target address.
@@ -1320,6 +1418,77 @@ fn system_page_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::System::Memory::{
+        VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+        PAGE_NOACCESS, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
+    };
+
+    struct TestPages {
+        base: usize,
+        size: usize,
+        page_size: usize,
+        blocked: Vec<bool>,
+    }
+
+    impl TestPages {
+        fn new(pages: usize) -> Self {
+            let page_size = system_page_size();
+            let size = page_size.checked_mul(pages).expect("test allocation size");
+            let base = unsafe {
+                VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) as usize
+            };
+            assert_ne!(base, 0, "VirtualAlloc failed");
+            Self {
+                base,
+                size,
+                page_size,
+                blocked: vec![false; pages],
+            }
+        }
+
+        fn fill_page(&mut self, index: usize, byte: u8) {
+            assert!(index < self.size / self.page_size);
+            assert!(!self.blocked[index], "cannot write to a blocked test page");
+            // SAFETY: The owned page is in bounds and remains writable.
+            unsafe {
+                ptr::write_bytes(
+                    (self.base + index * self.page_size) as *mut u8,
+                    byte,
+                    self.page_size,
+                );
+            }
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            assert_eq!(bytes.len(), self.size);
+            assert!(self.blocked.iter().all(|&blocked| !blocked));
+            // SAFETY: The source length matches the writable owned allocation.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), self.base as *mut u8, self.size) };
+        }
+
+        fn block_page(&mut self, index: usize) {
+            assert!(index < self.size / self.page_size);
+            let mut previous = PAGE_PROTECTION_FLAGS(0);
+            unsafe {
+                VirtualProtect(
+                    (self.base + index * self.page_size) as *const _,
+                    self.page_size,
+                    PAGE_NOACCESS,
+                    &mut previous,
+                )
+            }
+            .expect("protect test page");
+            self.blocked[index] = true;
+        }
+    }
+
+    impl Drop for TestPages {
+        fn drop(&mut self) {
+            // SAFETY: This is the base of the allocation owned by this guard.
+            unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) }
+                .expect("release test pages");
+        }
+    }
 
     fn reader_for(bytes: &mut [u8]) -> ReadContext {
         let base = bytes.as_mut_ptr() as usize;
@@ -1332,6 +1501,7 @@ mod tests {
             module_end: end,
             page_base,
             page_size,
+            page_shift: page_size.trailing_zeros(),
             readable: Arc::from(vec![true; count]),
         }
     }
@@ -1480,6 +1650,7 @@ mod tests {
             module_end: address + bytes.len(),
             page_base: align_down(address, page_size),
             page_size,
+            page_shift: page_size.trailing_zeros(),
             readable: Arc::from(vec![true, false]),
         };
         assert!(!reader.range_readable(address + 15, 2));
@@ -1592,10 +1763,7 @@ mod tests {
             .collect();
         assert_eq!(found, vec![first, second]);
 
-        assert_eq!(
-            seeker.string("label", ".rdata").unwrap().address(),
-            first
-        );
+        assert_eq!(seeker.string("label", ".rdata").unwrap().address(), first);
     }
 
     /// Why `strings` exists. The literal appears twice and only the second
@@ -1626,13 +1794,6 @@ mod tests {
     }
 
     #[test]
-    fn protection_flags_reject_guard_and_noaccess_pages() {
-        assert!(protection_is_readable(PAGE_READONLY));
-        assert!(!protection_is_readable(PAGE_NOACCESS));
-        assert!(!protection_is_readable(PAGE_READWRITE | PAGE_GUARD));
-    }
-
-    #[test]
     fn page_count_includes_the_last_partial_page_without_overflow() {
         assert_eq!(page_count(0x1001, 0x1FFF, 0x1000), 1);
         assert_eq!(page_count(0x1001, 0x2001, 0x1000), 2);
@@ -1641,30 +1802,652 @@ mod tests {
     }
 
     #[test]
+    fn readable_protections_accept_only_readable_base_flags() {
+        use windows::Win32::System::Memory::{
+            PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+            PAGE_GUARD, PAGE_NOCACHE, PAGE_READONLY, PAGE_WRITECOPY,
+        };
+
+        let mut info = MEMORY_BASIC_INFORMATION {
+            State: MEM_COMMIT,
+            ..Default::default()
+        };
+        for protection in [
+            PAGE_READONLY,
+            PAGE_READWRITE,
+            PAGE_WRITECOPY,
+            PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY,
+        ] {
+            info.Protect = protection;
+            assert!(region_is_readable(&info));
+            info.Protect = protection | PAGE_NOCACHE;
+            assert!(region_is_readable(&info));
+            info.Protect = protection | PAGE_GUARD;
+            assert!(!region_is_readable(&info));
+        }
+        for protection in [PAGE_NOACCESS, PAGE_EXECUTE, PAGE_PROTECTION_FLAGS(0)] {
+            info.Protect = protection;
+            assert!(!region_is_readable(&info));
+        }
+    }
+
+    #[test]
+    fn readable_regions_must_be_committed() {
+        let mut info = MEMORY_BASIC_INFORMATION {
+            State: MEM_RESERVE,
+            Protect: PAGE_READWRITE,
+            ..Default::default()
+        };
+        assert!(!region_is_readable(&info));
+        info.State = MEM_COMMIT;
+        assert!(region_is_readable(&info));
+    }
+
+    /// Address only, for tests that do not care which run it came from.
+    fn next_candidate_address(iter: &mut CandidateIter) -> Option<usize> {
+        iter.next_address().map(|(address, _)| address)
+    }
+
+    fn reader_with_pages(base: usize, page_size: usize, readable: Vec<bool>) -> ReadContext {
+        ReadContext {
+            module_base: base,
+            module_end: base + page_size * readable.len(),
+            page_base: base,
+            page_size,
+            page_shift: page_size.trailing_zeros(),
+            readable: readable.into(),
+        }
+    }
+
+    #[test]
     fn candidate_iterator_stops_at_the_last_valid_candidate() {
         let mut bytes = [0u8; 16];
         let reader = Arc::new(reader_for(&mut bytes));
-        let mut forward = CandidateIter::new(PreparedScan {
+        let runs: Arc<[Run]> = vec![Run {
             low: 10,
             high: 12,
+            limit: 16,
+        }]
+        .into();
+        let mut forward = CandidateIter::new(PreparedScan {
+            runs: runs.clone(),
             direction: Direction::Forward,
             reader: reader.clone(),
         });
-        assert_eq!(forward.next_address(), Some(10));
-        assert_eq!(forward.next_address(), Some(11));
-        assert_eq!(forward.next_address(), Some(12));
-        assert_eq!(forward.next_address(), None);
+        assert_eq!(next_candidate_address(&mut forward), Some(10));
+        assert_eq!(next_candidate_address(&mut forward), Some(11));
+        assert_eq!(next_candidate_address(&mut forward), Some(12));
+        assert_eq!(next_candidate_address(&mut forward), None);
 
         let mut backward = CandidateIter::new(PreparedScan {
-            low: 10,
-            high: 12,
+            runs,
             direction: Direction::Backward,
             reader,
         });
-        assert_eq!(backward.next_address(), Some(12));
-        assert_eq!(backward.next_address(), Some(11));
-        assert_eq!(backward.next_address(), Some(10));
-        assert_eq!(backward.next_address(), None);
+        assert_eq!(next_candidate_address(&mut backward), Some(12));
+        assert_eq!(next_candidate_address(&mut backward), Some(11));
+        assert_eq!(next_candidate_address(&mut backward), Some(10));
+        assert_eq!(next_candidate_address(&mut backward), None);
+    }
+
+    /// A blocked page sits between the two runs. Going forward the iterator
+    /// has to resume on the first address of the next run, going backward on
+    /// the last address of the previous one, or it drops a candidate.
+    #[test]
+    fn candidate_iterator_jumps_between_runs_without_dropping_one() {
+        let mut bytes = [0u8; 16];
+        let reader = Arc::new(reader_for(&mut bytes));
+        let runs: Arc<[Run]> = vec![
+            Run {
+                low: 10,
+                high: 12,
+                limit: 16,
+            },
+            Run {
+                low: 20,
+                high: 21,
+                limit: 32,
+            },
+        ]
+        .into();
+
+        let mut forward = CandidateIter::new(PreparedScan {
+            runs: runs.clone(),
+            direction: Direction::Forward,
+            reader: reader.clone(),
+        });
+        let forward_addresses: Vec<_> =
+            std::iter::from_fn(|| next_candidate_address(&mut forward)).collect();
+        assert_eq!(forward_addresses, vec![10, 11, 12, 20, 21]);
+
+        let mut backward = CandidateIter::new(PreparedScan {
+            runs,
+            direction: Direction::Backward,
+            reader,
+        });
+        let backward_addresses: Vec<_> =
+            std::iter::from_fn(|| next_candidate_address(&mut backward)).collect();
+        assert_eq!(backward_addresses, vec![21, 20, 12, 11, 10]);
+    }
+
+    #[test]
+    fn span_check_uses_the_end_of_the_last_readable_page() {
+        let mut bytes = [0u8; 16];
+        let reader = Arc::new(reader_for(&mut bytes));
+        let run = Run {
+            low: 10,
+            high: 12,
+            limit: 16,
+        };
+        let iter = CandidateIter::new(PreparedScan {
+            runs: vec![run].into(),
+            direction: Direction::Forward,
+            reader,
+        });
+        // A four byte pattern still fits before the limit.
+        assert!(iter.span_is_readable(run, 12, 4));
+        // One more byte would cross it.
+        assert!(!iter.span_is_readable(run, 12, 5));
+    }
+
+    /// The last candidate of a run is yielded together with that run, not with
+    /// the run the iterator has already moved on to. Using the next run's limit
+    /// here would let a pattern read across the blocked page in between.
+    #[test]
+    fn a_candidate_keeps_the_run_it_belongs_to() {
+        let mut bytes = [0u8; 64];
+        let reader = Arc::new(reader_for(&mut bytes));
+        let first = Run {
+            low: 10,
+            high: 12,
+            limit: 16,
+        };
+        let second = Run {
+            low: 20,
+            high: 21,
+            limit: 64,
+        };
+        let mut iter = CandidateIter::new(PreparedScan {
+            runs: vec![first, second].into(),
+            direction: Direction::Forward,
+            reader,
+        });
+        assert_eq!(iter.next_address(), Some((10, first)));
+        assert_eq!(iter.next_address(), Some((11, first)));
+        assert_eq!(iter.next_address(), Some((12, first)));
+        assert_eq!(iter.next_address(), Some((20, second)));
+        assert_eq!(iter.next_address(), Some((21, second)));
+        assert_eq!(iter.next_address(), None);
+    }
+
+    /// Four pages, the middle two blocked, a start that is not page aligned and
+    /// an end that stops inside the last page.
+    #[test]
+    fn readable_runs_clip_to_the_window_and_keep_the_page_limit() {
+        let base = 0x1000;
+        let reader = reader_with_pages(base, 16, vec![true, false, false, true]);
+        let runs = readable_runs(&reader, base + 4, base + 3 * 16 + 5);
+        assert_eq!(
+            runs,
+            vec![
+                Run {
+                    low: base + 4,
+                    high: base + 15,
+                    limit: base + 16
+                },
+                Run {
+                    low: base + 3 * 16,
+                    high: base + 3 * 16 + 5,
+                    limit: base + 4 * 16
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn readable_runs_collapse_adjacent_readable_pages() {
+        let base = 0x1000;
+        let reader = reader_with_pages(base, 16, vec![true, true, true]);
+        let runs = readable_runs(&reader, base + 1, base + 47);
+        assert_eq!(
+            runs,
+            vec![Run {
+                low: base + 1,
+                high: base + 47,
+                limit: base + 48
+            }]
+        );
+    }
+
+    /// Walks the same window with and without blocked pages and checks that
+    /// the iterator yields exactly the candidates a brute-force walk would.
+    #[test]
+    fn iterator_yields_exactly_the_readable_candidates() {
+        let base = 0x1000;
+        let page = 16;
+        let layout = vec![true, false, true, true, false, true];
+        let reader = Arc::new(reader_with_pages(base, page, layout.clone()));
+        let low = base + 3;
+        let high = base + page * layout.len() - 5;
+        let expected: Vec<usize> = (low..=high)
+            .filter(|&address| reader.page_readable(address))
+            .collect();
+
+        let runs = readable_runs(&reader, low, high);
+        let mut iter = CandidateIter::new(PreparedScan {
+            runs: runs.into(),
+            direction: Direction::Forward,
+            reader: reader.clone(),
+        });
+        let forward: Vec<usize> =
+            std::iter::from_fn(|| next_candidate_address(&mut iter)).collect();
+        assert_eq!(forward, expected);
+
+        let runs = readable_runs(&reader, low, high);
+        let mut iter = CandidateIter::new(PreparedScan {
+            runs: runs.into(),
+            direction: Direction::Backward,
+            reader,
+        });
+        let mut backward: Vec<usize> =
+            std::iter::from_fn(|| next_candidate_address(&mut iter)).collect();
+        backward.reverse();
+        assert_eq!(backward, expected);
+    }
+
+    /// Four real pages, the second one PAGE_NOACCESS and filled with a byte
+    /// that would match if anything read it. Reaching it faults the process,
+    /// so this fails loudly rather than returning a wrong address.
+    #[test]
+    fn blocked_page_is_never_read() {
+        let mut allocation = TestPages::new(4);
+        let (base, size, page) = (allocation.base, allocation.size, allocation.page_size);
+        allocation.fill_page(0, 0xAA);
+        allocation.fill_page(1, 0xAA);
+        allocation.fill_page(3, 0xAA);
+        allocation.block_page(1);
+
+        let reader = Arc::new(
+            ReadContext::new(base, base + size, page, base, base + size)
+                .expect("page cache for the buffer"),
+        );
+        let runs = readable_runs(&reader, base, base + size - 1);
+        let mut matches = Matches {
+            pattern: Pattern::bytes(&[0xAA]).unwrap(),
+            iter: CandidateIter::new(PreparedScan {
+                runs: runs.into(),
+                direction: Direction::Forward,
+                reader,
+            }),
+            _marker: std::marker::PhantomData,
+        };
+        let hits: Vec<usize> = std::iter::from_fn(|| matches.next().map(Match::address)).collect();
+
+        assert_eq!(hits.len(), page * 2, "pages 0 and 3 are the only matches");
+        assert!(hits
+            .iter()
+            .all(|&address| address < base + page || address >= base + 3 * page));
+    }
+
+    /// A pattern that starts near the end of a readable page must not be
+    /// compared when its last byte would land in the blocked page behind it.
+    #[test]
+    fn a_span_crossing_into_a_blocked_page_is_rejected() {
+        let mut allocation = TestPages::new(2);
+        let (base, size, page) = (allocation.base, allocation.size, allocation.page_size);
+        allocation.fill_page(0, 0xAA);
+        allocation.block_page(1);
+
+        let reader = Arc::new(
+            ReadContext::new(base, base + size, page, base, base + size)
+                .expect("page cache for the buffer"),
+        );
+        let runs = readable_runs(&reader, base, base + size - 1);
+        let mut matches = Matches {
+            pattern: Pattern::bytes(&[0xAA, 0xAA, 0xAA, 0xAA]).unwrap(),
+            iter: CandidateIter::new(PreparedScan {
+                runs: runs.into(),
+                direction: Direction::Forward,
+                reader,
+            }),
+            _marker: std::marker::PhantomData,
+        };
+        let hits: Vec<usize> = std::iter::from_fn(|| matches.next().map(Match::address)).collect();
+
+        // Page 0 is solid `0xAA`, so every four-byte window that stays inside it
+        // matches: starts `base ..= base + page - 4`.
+        let last = base + page - 4;
+        assert_eq!(
+            hits.len(),
+            page - 3,
+            "every four-byte window in page 0 matches"
+        );
+        assert_eq!(hits.first().copied(), Some(base));
+        assert_eq!(hits.last().copied(), Some(last));
+        assert!(
+            !hits.contains(&(last + 1)),
+            "a start whose fourth byte lands in the blocked page must be rejected"
+        );
+    }
+
+    /// The last candidate of the first run is followed by a second run whose
+    /// limit sits much further away. The span check must use the first run's
+    /// limit there, otherwise the compare reads the blocked page in between.
+    #[test]
+    fn a_match_never_reads_across_a_blocked_page_between_runs() {
+        let mut allocation = TestPages::new(3);
+        let (base, size, page) = (allocation.base, allocation.size, allocation.page_size);
+        allocation.fill_page(0, 0xAA);
+        allocation.fill_page(2, 0xAA);
+        allocation.block_page(1);
+
+        let reader = Arc::new(
+            ReadContext::new(base, base + size, page, base, base + size)
+                .expect("page cache for the buffer"),
+        );
+        let runs = readable_runs(&reader, base, base + size - 1);
+        assert_eq!(
+            runs.len(),
+            2,
+            "two readable stretches around the blocked page"
+        );
+        let mut matches = Matches {
+            pattern: Pattern::bytes(&[0xAA, 0xAA, 0xAA, 0xAA]).unwrap(),
+            iter: CandidateIter::new(PreparedScan {
+                runs: runs.into(),
+                direction: Direction::Forward,
+                reader,
+            }),
+            _marker: std::marker::PhantomData,
+        };
+        let hits: Vec<usize> = std::iter::from_fn(|| matches.next().map(Match::address)).collect();
+
+        assert_eq!(hits.len(), 2 * (page - 3), "both readable pages match");
+        assert!(hits.iter().all(|&address| {
+            (address + 4 <= base + page)
+                || (address >= base + 2 * page && address + 4 <= base + size)
+        }));
+    }
+
+    #[test]
+    fn a_fully_blocked_window_yields_nothing() {
+        let base = 0x1000;
+        let reader = Arc::new(reader_with_pages(base, 16, vec![false, false]));
+        let runs = readable_runs(&reader, base, base + 31);
+        assert!(runs.is_empty());
+        let mut iter = CandidateIter::new(PreparedScan {
+            runs: runs.into(),
+            direction: Direction::Forward,
+            reader,
+        });
+        assert_eq!(next_candidate_address(&mut iter), None);
+    }
+
+    /// Deterministic pseudo-random generator, so the layout, the bytes and the
+    /// pattern all move between rounds without pulling in a dependency.
+    struct SmallRng(u64);
+
+    impl SmallRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+    }
+
+    /// Randomized differential check over a real allocation: random readable
+    /// layout, random bytes, random wildcard pattern, random window and both
+    /// directions. The scanner must report exactly the true matches a
+    /// brute-force walk finds, once each, in scan order.
+    #[test]
+    fn randomized_layouts_agree_with_a_brute_force_walk() {
+        let mut rng = SmallRng(0x5EED_1234_ABCD_9876);
+        for round in 0..32 {
+            let pages = 3 + rng.below(4);
+            let mut allocation = TestPages::new(pages);
+            let (base, size, page) = (allocation.base, allocation.size, allocation.page_size);
+
+            // A two-byte alphabet keeps exact patterns matching often enough
+            // for a round to be interesting.
+            let mut bytes = vec![0u8; size];
+            for byte in bytes.iter_mut() {
+                *byte = if rng.next() & 1 == 0 { 0xAA } else { 0xBB };
+            }
+            allocation.write(&bytes);
+
+            let mut readable = vec![true; pages];
+            let blocked = 1 + rng.below(pages / 2 + 1);
+            let mut placed = 0;
+            while placed < blocked {
+                let index = rng.below(pages);
+                if readable[index] {
+                    readable[index] = false;
+                    placed += 1;
+                }
+            }
+            for (index, &open) in readable.iter().enumerate() {
+                if open {
+                    continue;
+                }
+                allocation.block_page(index);
+            }
+
+            let len = 1 + rng.below(6);
+            let mut pattern_bytes = vec![0u8; len];
+            let mut mask = String::with_capacity(len);
+            for byte in pattern_bytes.iter_mut() {
+                *byte = if rng.next() & 1 == 0 { 0xAA } else { 0xBB };
+                mask.push(if rng.next().is_multiple_of(3) {
+                    '?'
+                } else {
+                    'x'
+                });
+            }
+            let pattern = Pattern::masked(&pattern_bytes, &mask).expect("valid mask");
+
+            let low = base + rng.below(size - len + 1);
+            let high = low + rng.below(base + size - len - low + 1);
+            let reader = Arc::new(
+                ReadContext::new(base, base + size, page, low, high + len)
+                    .expect("page cache for the buffer"),
+            );
+
+            let expected: Vec<usize> = (low..=high)
+                .filter(|&address| {
+                    (0..len).all(|index| readable[(address - base + index) / page])
+                        && (0..len).all(|index| {
+                            mask.as_bytes()[index] == b'?'
+                                || unsafe {
+                                    *((address + index) as *const u8) == pattern_bytes[index]
+                                }
+                        })
+                })
+                .collect();
+
+            for direction in [Direction::Forward, Direction::Backward] {
+                let mut matches = Matches {
+                    pattern: pattern.clone(),
+                    iter: CandidateIter::new(PreparedScan {
+                        runs: readable_runs(&reader, low, high).into(),
+                        direction,
+                        reader: reader.clone(),
+                    }),
+                    _marker: std::marker::PhantomData,
+                };
+                let hits: Vec<usize> =
+                    std::iter::from_fn(|| matches.next().map(Match::address)).collect();
+                let mut sorted = hits.clone();
+                sorted.sort_unstable();
+                assert_eq!(
+                    sorted, expected,
+                    "round {round}: {direction:?} over {low:#x}..={high:#x}, \
+                     {blocked} blocked page(s), pattern {mask}"
+                );
+                let ordered = if direction == Direction::Forward {
+                    hits.windows(2).all(|pair| pair[0] < pair[1])
+                } else {
+                    hits.windows(2).all(|pair| pair[0] > pair[1])
+                };
+                assert!(ordered, "round {round}: {direction:?} order");
+            }
+        }
+    }
+
+    #[test]
+    fn long_patterns_respect_blocked_pages_and_cached_run_limits() {
+        let mut allocation = TestPages::new(5);
+        let (base, size, page) = (allocation.base, allocation.size, allocation.page_size);
+        for index in 0..5 {
+            allocation.fill_page(index, 0xAA);
+        }
+        allocation.block_page(2);
+
+        for len in [page + 3, 2 * page + 1] {
+            let pattern = Pattern::bytes(&vec![0xAA; len]).unwrap();
+            for (low, high) in [
+                (base + page - 8, base + page - 4),
+                (base + page - 8, base + page + 8),
+                (base + 3 * page - 4, base + 3 * page + 4),
+            ] {
+                if high + len > base + size {
+                    continue;
+                }
+                let reader =
+                    Arc::new(ReadContext::new(base, base + size, page, low, high + len).unwrap());
+                let expected: Vec<_> = (low..=high)
+                    .filter(|&address| {
+                        let first = (address - base) / page;
+                        let last = (address - base + len - 1) / page;
+                        (first..=last).all(|index| !allocation.blocked[index])
+                    })
+                    .collect();
+                for direction in [Direction::Forward, Direction::Backward] {
+                    let matches = Matches {
+                        pattern: pattern.clone(),
+                        iter: CandidateIter::new(PreparedScan {
+                            runs: readable_runs(&reader, low, high).into(),
+                            direction,
+                            reader: reader.clone(),
+                        }),
+                        _marker: std::marker::PhantomData,
+                    };
+                    let hits: Vec<_> = matches.map(Match::address).collect();
+                    let mut expected = expected.clone();
+                    if direction == Direction::Backward {
+                        expected.reverse();
+                    }
+                    assert_eq!(
+                        hits, expected,
+                        "{direction:?}, len={len}, {low:#x}..={high:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same differential check against a real loaded section, so the page
+    /// cache comes from the loader's layout instead of a hand-built one.
+    #[test]
+    fn text_section_scan_agrees_with_a_brute_force_walk() {
+        let seeker = Seeker::with_name("main").expect("bind the test executable");
+        let sections = seeker.sections();
+        let text = sections.get(".text").expect("the executable has .text");
+        let len = 6usize;
+        assert!(text.section_size > len * 2, ".text must hold the probe");
+        let probe = text.section_base + text.section_size / 2;
+        let bytes = unsafe { std::slice::from_raw_parts(probe as *const u8, len) };
+        let pattern = Pattern::bytes(bytes).expect("probe pattern");
+        let hits: Vec<usize> = seeker
+            .scan(&pattern)
+            .expect("scan")
+            .in_section(".text")
+            .all()
+            .expect("all")
+            .map(Match::address)
+            .collect();
+        assert!(hits.contains(&probe), "the probe address must be reported");
+
+        let module = seeker.ensure_module().expect("module");
+        let reader = Arc::new(
+            ReadContext::new(
+                module.base,
+                module.end,
+                seeker.page_size,
+                text.section_base,
+                text.section_base + text.section_size,
+            )
+            .expect("page cache for .text"),
+        );
+        let high = text.section_base + text.section_size - len;
+        let expected: Vec<usize> = (text.section_base..=high)
+            .filter(|&address| {
+                // SAFETY: The checked span is in the test executable's code,
+                // which remains loaded and unchanged throughout this test.
+                reader.range_readable(address, len) && unsafe { pattern.compare(address) }
+            })
+            .collect();
+        assert_eq!(hits, expected);
+    }
+
+    /// Time candidate iteration over precomputed runs with synthetic page maps.
+    /// This excludes run construction, page queries and pattern comparison.
+    /// Run with `cargo test --release -- --ignored --nocapture blocked_pages`.
+    #[test]
+    #[ignore = "timing harness, prints numbers instead of asserting"]
+    fn blocked_pages_reduce_candidate_iteration_work() {
+        fn time(runs: Vec<Run>, reader: Arc<ReadContext>) -> (usize, std::time::Duration) {
+            let mut iter = CandidateIter::new(PreparedScan {
+                runs: runs.into(),
+                direction: Direction::Forward,
+                reader,
+            });
+            let start = std::time::Instant::now();
+            let mut count = 0usize;
+            while next_candidate_address(&mut iter).is_some() {
+                count += 1;
+            }
+            (count, start.elapsed())
+        }
+
+        let page = 4096;
+        let pages = 512;
+        let base = 0x1000_0000usize;
+        let low = base;
+        let high = base + page * pages - 16;
+
+        let reader = |readable: Vec<bool>| {
+            Arc::new(ReadContext {
+                module_base: base,
+                module_end: base + page * pages,
+                page_base: base,
+                page_size: page,
+                page_shift: page.trailing_zeros(),
+                readable: readable.into(),
+            })
+        };
+
+        let all_open = reader(vec![true; pages]);
+        let (all_count, all_time) = time(readable_runs(&all_open, low, high), all_open);
+
+        let mut half = vec![true; pages];
+        for index in (0..pages).step_by(2) {
+            half[index] = false;
+        }
+        let half_open = reader(half);
+        let (half_count, half_time) = time(readable_runs(&half_open, low, high), half_open);
+
+        println!(
+            "all readable: {all_count} candidates in {all_time:?}
+half blocked: {half_count} candidates in {half_time:?}"
+        );
     }
 
     #[test]

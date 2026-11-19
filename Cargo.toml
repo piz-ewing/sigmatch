@@ -1,6 +1,6 @@
 [package]
 name = "sigmatch"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "A memory signature search library for the Windows platform written in Rust."
 keywords = ["signature", "sigmatch", "sig", "pattern", "sigsearch"]
@@ -30,6 +30,10 @@ features = [
 
 [[example]]
 name = "demo"
+
+[[bench]]
+name = "scan"
+harness = false
 
 [dev-dependencies]
 pretty_env_logger = "0.5"
